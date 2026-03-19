@@ -61,6 +61,10 @@ class AudioCaptureService : LifecycleService() {
     companion object {
         const val EXTRA_RESULT_CODE      = "extra_result_code"
         const val EXTRA_PROJECTION_DATA  = "extra_projection_data"
+        const val EXTRA_DEBUG_MODE       = "extra_debug_mode"
+        const val EXTRA_AUDIO_SOURCE     = "extra_audio_source"
+        const val AUDIO_SOURCE_MIC       = "mic"
+        const val AUDIO_SOURCE_SYSTEM    = "system"
     }
 
     private val serviceJob = SupervisorJob()
@@ -73,6 +77,9 @@ class AudioCaptureService : LifecycleService() {
     private var captureManager: AudioCaptureManager? = null
     private var asrEngine: AsrEngine? = null
     private var translationEngine: TranslationEngine? = null
+
+    private var isDebugMode: Boolean = false
+    private var audioSource: String = AUDIO_SOURCE_SYSTEM
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -101,7 +108,11 @@ class AudioCaptureService : LifecycleService() {
         } else {
             startForeground(NOTIFICATION_ID, buildNotification())
         }
+        isDebugMode = intent?.getBooleanExtra(EXTRA_DEBUG_MODE, false) ?: false
+        audioSource = intent?.getStringExtra(EXTRA_AUDIO_SOURCE) ?: AUDIO_SOURCE_SYSTEM
+
         overlay.attach()
+        overlay.setDebugMode(isDebugMode)
         overlay.setState(PipelineState.INITIALIZING)
 
         observeDownloadProgress()
@@ -113,7 +124,7 @@ class AudioCaptureService : LifecycleService() {
         serviceScope.launch(CoroutineDispatcherProvider.asr) {
             try {
                 initEngines()
-                startPipeline(projection)
+                startPipeline(projection, forceMic = (audioSource == AUDIO_SOURCE_MIC))
             } catch (e: Exception) {
                 Log.e(TAG, "Pipeline init failed", e)
                 writeCrashLog("Pipeline", e)
@@ -226,20 +237,27 @@ class AudioCaptureService : LifecycleService() {
         } else {
             Log.d(TAG, "NLLB 모델 없음 — 번역 생략 (원문 표시)")
         }
+
+        overlay.showEngineStatus(
+            asrReady = asrEngine?.isReady == true,
+            translationReady = translationEngine?.isReady == true,
+            audioSource = audioSource
+        )
     }
 
     // -------------------------------------------------------------------------
     // Audio pipeline
     // -------------------------------------------------------------------------
 
-    private fun startPipeline(projection: android.media.projection.MediaProjection?) {
+    private fun startPipeline(projection: android.media.projection.MediaProjection?, forceMic: Boolean = false) {
         val audioChunker = AudioChunker()
         chunker = audioChunker
 
         captureManager = AudioCaptureManager(
             chunker = audioChunker,
             mediaProjection = projection,
-            onLevelUpdate = { dbfs -> overlay.updateLevel(dbfs) }
+            onLevelUpdate = { dbfs -> overlay.updateLevel(dbfs) },
+            forceMic = forceMic
         ).also { it.start() }
 
         overlay.setState(PipelineState.LISTENING)
@@ -261,8 +279,10 @@ class AudioCaptureService : LifecycleService() {
         // Energy-based VAD: skip silence to prevent Whisper hallucinations.
         val rms = computeRms(chunk)
 
-        // 항상 debug overlay에 RMS 표시 → 오디오 입력이 되는지 화면에서 확인 가능
-        overlay.showDebugInfo(rms = rms, translationReady = translationEngine?.isReady == true)
+        // RMS 표시 — debug 모드일 때만
+        if (isDebugMode) {
+            overlay.showDebugInfo(rms = rms, translationReady = translationEngine?.isReady == true)
+        }
 
         if (rms < VAD_RMS_THRESHOLD) {
             Log.v(TAG, "VAD: 묵음 (rms=${"%.4f".format(rms)}) — skip")
@@ -275,13 +295,15 @@ class AudioCaptureService : LifecycleService() {
         val result = asr.transcribe(chunk)
         Log.i(TAG, "ASR 결과: \"${result.text}\" [lang=${result.language}] [empty=${result.isEmpty}]")
 
-        // ASR 결과를 debug overlay에 즉시 표시
-        overlay.showDebugInfo(
-            rms = rms,
-            asrText = result.text,
-            lang = result.language,
-            translationReady = translationEngine?.isReady == true
-        )
+        // ASR 결과를 debug overlay에 표시 — debug 모드일 때만
+        if (isDebugMode) {
+            overlay.showDebugInfo(
+                rms = rms,
+                asrText = result.text,
+                lang = result.language,
+                translationReady = translationEngine?.isReady == true
+            )
+        }
 
         if (result.isEmpty) {
             Log.d(TAG, "ASR: 빈 결과 — skip")

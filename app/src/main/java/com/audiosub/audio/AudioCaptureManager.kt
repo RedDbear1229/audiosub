@@ -39,7 +39,8 @@ private const val AUDIO_FORMAT        = AudioFormat.ENCODING_PCM_16BIT
 class AudioCaptureManager(
     private val chunker: AudioChunker,
     private val mediaProjection: MediaProjection? = null,
-    private val onLevelUpdate: ((dbfs: Float) -> Unit)? = null
+    private val onLevelUpdate: ((dbfs: Float) -> Unit)? = null,
+    private val forceMic: Boolean = false
 ) {
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
@@ -54,7 +55,7 @@ class AudioCaptureManager(
         val minBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE_CAPTURE, CHANNEL_CONFIG, AUDIO_FORMAT)
             .takeIf { it > 0 } ?: (SAMPLE_RATE_CAPTURE / 5 * 2)
 
-        val record = if (mediaProjection != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val record = if (!forceMic && mediaProjection != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val sys = buildSystemAudioRecord(mediaProjection, minBufSize)
             if (sys != null) {
                 Log.i(TAG, "✓ 시스템 오디오 캡처 활성화 (MediaProjection)")
@@ -63,7 +64,7 @@ class AudioCaptureManager(
             }
             sys ?: buildMicRecord(minBufSize)
         } else {
-            Log.i(TAG, "MediaProjection 없음 → 마이크 사용")
+            Log.i(TAG, if (forceMic) "강제 마이크 모드" else "MediaProjection 없음 → 마이크 사용")
             buildMicRecord(minBufSize)
         }
 

@@ -1,0 +1,11 @@
+sherpa-onnx-whisper-medium/
+sherpa-onnx-whisper-medium/medium-encoder.onnx
+sherpa-onnx-whisper-medium/medium-tokens.txt
+sherpa-onnx-whisper-medium/medium-decoder.int8.onnx
+sherpa-onnx-whisper-medium/medium-encoder.int8.onnx
+sherpa-onnx-whisper-medium/medium-decoder.onnx
+sherpa-onnx-whisper-medium/test_wavs/
+sherpa-onnx-whisper-medium/test_wavs/8k.wav
+sherpa-onnx-whisper-medium/test_wavs/0.wav
+sherpa-onnx-whisper-medium/test_wavs/1.wav
+sherpa-onnx-whisper-medium/test_wavs/trans.txt

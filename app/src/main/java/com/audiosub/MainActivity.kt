@@ -24,6 +24,9 @@ import com.audiosub.service.AudioCaptureService
 import com.audiosub.util.PermissionHelper
 
 private const val TAG = "MainActivity"
+private const val PREFS_NAME = "audiosub_prefs"
+private const val PREF_DEBUG_MODE = "debug_mode"
+private const val PREF_AUDIO_SOURCE = "audio_source"
 
 class MainActivity : AppCompatActivity() {
 
@@ -42,6 +45,7 @@ class MainActivity : AppCompatActivity() {
         // Android 14+: getMediaProjection() must be called AFTER the mediaProjection-type
         // foreground service has called startForeground(). So we pass the raw resultCode
         // and data Intent to the service and let it call getMediaProjection() itself.
+        val isDebug = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_DEBUG_MODE, false)
         val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
             if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
                 putExtra(AudioCaptureService.EXTRA_RESULT_CODE, result.resultCode)
@@ -50,6 +54,8 @@ class MainActivity : AppCompatActivity() {
             } else {
                 Log.w(TAG, "MediaProjection denied (resultCode=${result.resultCode}) — mic fallback")
             }
+            putExtra(AudioCaptureService.EXTRA_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_SYSTEM)
+            putExtra(AudioCaptureService.EXTRA_DEBUG_MODE, isDebug)
         }
         startForegroundService(serviceIntent)
         serviceRunning = true
@@ -63,6 +69,34 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         downloadManager = ModelDownloadManager(this)
+
+        // Restore prefs state
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val savedDebug = prefs.getBoolean(PREF_DEBUG_MODE, false)
+        val savedSource = prefs.getString(PREF_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_SYSTEM)
+            ?: AudioCaptureService.AUDIO_SOURCE_SYSTEM
+
+        binding.switchDebugMode.isChecked = savedDebug
+        if (savedSource == AudioCaptureService.AUDIO_SOURCE_MIC) {
+            binding.radioMic.isChecked = true
+        } else {
+            binding.radioSystem.isChecked = true
+        }
+
+        // Save debug mode on change
+        binding.switchDebugMode.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(PREF_DEBUG_MODE, isChecked).apply()
+        }
+
+        // Save audio source on change
+        binding.radioGroupAudioSource.setOnCheckedChangeListener { _, checkedId ->
+            val source = if (checkedId == R.id.radioMic) {
+                AudioCaptureService.AUDIO_SOURCE_MIC
+            } else {
+                AudioCaptureService.AUDIO_SOURCE_SYSTEM
+            }
+            prefs.edit().putString(PREF_AUDIO_SOURCE, source).apply()
+        }
 
         binding.btnToggleService.setOnClickListener {
             if (serviceRunning) stopAudioService()
@@ -107,7 +141,16 @@ class MainActivity : AppCompatActivity() {
             PermissionHelper.requestRecordAudioPermission(this)
             return
         }
-        requestMediaProjection()
+
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val source = prefs.getString(PREF_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_SYSTEM)
+            ?: AudioCaptureService.AUDIO_SOURCE_SYSTEM
+
+        if (source == AudioCaptureService.AUDIO_SOURCE_MIC) {
+            startServiceWithMic()
+        } else {
+            requestMediaProjection()
+        }
     }
 
     @Suppress("OVERRIDE_DEPRECATION")
@@ -120,7 +163,7 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PermissionHelper.REQUEST_RECORD_AUDIO) {
             if (grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                requestMediaProjection()
+                checkPermissionsAndStart()
             } else {
                 Toast.makeText(this, "오디오 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
             }
@@ -129,6 +172,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestMediaProjection() {
         mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+    }
+
+    private fun startServiceWithMic() {
+        val isDebug = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_DEBUG_MODE, false)
+        val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
+            putExtra(AudioCaptureService.EXTRA_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_MIC)
+            putExtra(AudioCaptureService.EXTRA_DEBUG_MODE, isDebug)
+        }
+        startForegroundService(serviceIntent)
+        serviceRunning = true
+        binding.btnToggleService.text = getString(R.string.stop_service)
+        showStatus(getString(R.string.listening))
     }
 
     // -------------------------------------------------------------------------

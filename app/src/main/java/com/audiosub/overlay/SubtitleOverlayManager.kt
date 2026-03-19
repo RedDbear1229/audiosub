@@ -48,6 +48,8 @@ class SubtitleOverlayManager(private val context: Context) {
     private var fadeAnimator: ObjectAnimator? = null
     private var subtitleHideRunnable: Runnable? = null
 
+    private var debugMode: Boolean = false
+
     val isAttached: Boolean get() = overlayRoot != null
 
     // -------------------------------------------------------------------------
@@ -150,12 +152,32 @@ class SubtitleOverlayManager(private val context: Context) {
      * Displays ASR raw text, detected language, RMS, and translation engine status.
      * Call from AudioCaptureService during processChunk() for pipeline diagnosis.
      */
+    fun setDebugMode(enabled: Boolean) {
+        debugMode = enabled
+        mainHandler.post {
+            tvDebug?.visibility = if (enabled) View.VISIBLE else View.GONE
+        }
+    }
+
+    fun showEngineStatus(asrReady: Boolean, translationReady: Boolean, audioSource: String) {
+        if (!debugMode) return
+        mainHandler.post {
+            val tv = tvDebug ?: return@post
+            val asrStatus = if (asrReady) "✓준비됨" else "✗없음"
+            val xlat = if (translationReady) "✓준비됨" else "✗없음"
+            val src = if (audioSource == "mic") "마이크" else "시스템"
+            tv.text = "ASR: $asrStatus  번역: $xlat  소스: $src"
+            tv.visibility = View.VISIBLE
+        }
+    }
+
     fun showDebugInfo(
         rms: Float,
         asrText: String? = null,
         lang: String? = null,
         translationReady: Boolean = false
     ) {
+        if (!debugMode) return
         mainHandler.post {
             val tv = tvDebug ?: return@post
             val sb = StringBuilder()

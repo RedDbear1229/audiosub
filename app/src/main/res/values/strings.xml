@@ -15,4 +15,8 @@
     <string name="listening">듣는 중...</string>
     <string name="transcribing">전사 중...</string>
     <string name="translating">번역 중...</string>
+    <string name="debug_mode">디버그 모드</string>
+    <string name="audio_source_mic">마이크</string>
+    <string name="audio_source_system">시스템 오디오</string>
+    <string name="audio_source_label">오디오 소스</string>
 </resources>
