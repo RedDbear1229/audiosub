@@ -1,0 +1,35 @@
+# Build outputs
+app/build/
+build/
+
+# Gradle
+.gradle/
+local.properties
+
+# Android SDK / NDK
+*.apk
+*.aab
+*.dex
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Keystore (do not commit)
+*.jks
+*.keystore
+
+# Native libs — large binaries downloaded separately
+app/src/main/jniLibs/
+
+# sherpa-onnx local JAR — downloaded separately
+app/libs/
+
+# Crash logs
+crash_log.txt
+crash_*.txt
+
+# Claude Code temp files
+'$HOME'/.tmp/
+.claude/

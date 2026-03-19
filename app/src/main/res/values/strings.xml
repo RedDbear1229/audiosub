@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">audiosub</string>
+    <string name="start_service">서비스 시작</string>
+    <string name="stop_service">서비스 중지</string>
+    <string name="overlay_permission_required">오버레이 권한이 필요합니다</string>
+    <string name="grant_overlay_permission">권한 설정</string>
+    <string name="notification_channel_name">AudioSub 자막 서비스</string>
+    <string name="notification_channel_desc">오디오 캡처 및 실시간 자막 표시 서비스</string>
+    <string name="notification_title">AudioSub 실행 중</string>
+    <string name="notification_text">시스템 오디오를 캡처하여 한국어 자막을 표시합니다.</string>
+    <string name="downloading_models">모델 다운로드 중...</string>
+    <string name="models_ready">모델 준비 완료</string>
+    <string name="initializing">초기화 중...</string>
+    <string name="listening">듣는 중...</string>
+    <string name="transcribing">전사 중...</string>
+    <string name="translating">번역 중...</string>
+</resources>

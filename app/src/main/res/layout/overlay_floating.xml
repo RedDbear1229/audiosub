@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Floating overlay window: always-visible status bar + fade-in subtitle -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <!-- Subtitle text — shown only when ASR/translation produces output -->
+    <TextView
+        android:id="@+id/tvSubtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:background="@drawable/subtitle_bg"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.25"
+        android:maxLines="3"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="10dp"
+        android:text=""
+        android:textColor="@color/subtitle_text"
+        android:textSize="20sp"
+        android:visibility="gone" />
+
+    <!-- Status bar — always visible while service is running -->
+    <LinearLayout
+        android:id="@+id/statusBar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:background="@drawable/status_bar_bg"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="6dp">
+
+        <!-- Colored status dot -->
+        <View
+            android:id="@+id/statusDot"
+            android:layout_width="8dp"
+            android:layout_height="8dp"
+            android:layout_marginEnd="8dp"
+            android:background="@drawable/status_dot" />
+
+        <!-- Status text -->
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="초기화 중..."
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp" />
+
+        <!-- Audio level meter (dBFS) — debug only -->
+        <TextView
+            android:id="@+id/tvLevel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:text=""
+            android:textColor="#88FFFFFF"
+            android:textSize="11sp"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</LinearLayout>
