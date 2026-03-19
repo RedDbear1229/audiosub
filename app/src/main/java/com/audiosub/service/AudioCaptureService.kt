@@ -257,6 +257,10 @@ class AudioCaptureService : LifecycleService() {
             chunker = audioChunker,
             mediaProjection = projection,
             onLevelUpdate = { dbfs -> overlay.updateLevel(dbfs) },
+            onCaptureSourceReady = { source, config ->
+                Log.i(TAG, "캡처 소스 확정: source=$source config=$config")
+                overlay.updateCaptureSource(source, config)
+            },
             forceMic = forceMic
         ).also { it.start() }
 

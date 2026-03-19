@@ -19,32 +19,48 @@ import kotlin.math.sqrt
 
 private const val TAG = "AudioCaptureManager"
 
-private const val SAMPLE_RATE_ASR     = 16_000
-private const val SAMPLE_RATE_CAPTURE = 44_100
-private const val CHANNEL_CONFIG      = AudioFormat.CHANNEL_IN_MONO
-private const val AUDIO_FORMAT        = AudioFormat.ENCODING_PCM_16BIT
+private const val SAMPLE_RATE_ASR = 16_000
+private const val AUDIO_FORMAT    = AudioFormat.ENCODING_PCM_16BIT
+
+/**
+ * Ordered list of (sampleRate, channelMask, label) configs to try for system audio.
+ * Most Android devices use a 48kHz stereo mixer; 44.1kHz stereo is a common fallback.
+ */
+private val SYSTEM_AUDIO_CONFIGS = listOf(
+    Triple(48_000, AudioFormat.CHANNEL_IN_STEREO, "48k-stereo"),
+    Triple(48_000, AudioFormat.CHANNEL_IN_MONO,   "48k-mono"),
+    Triple(44_100, AudioFormat.CHANNEL_IN_STEREO, "44.1k-stereo"),
+    Triple(44_100, AudioFormat.CHANNEL_IN_MONO,   "44.1k-mono"),
+)
 
 /**
  * Manages audio capture via [AudioRecord].
  *
- * When [mediaProjection] is provided (Android 10+), captures system audio playback.
- * Otherwise falls back to microphone.
+ * When [mediaProjection] is provided (Android 10+), attempts system audio playback capture
+ * using multiple sample-rate/channel configs. Falls back to microphone when all system
+ * audio configs fail.
  *
- * Captured PCM is converted to Float32 at 16 kHz and pushed into [chunker].
- *
- * @param chunker        Destination sliding-window chunker.
- * @param mediaProjection Optional [MediaProjection] for system audio capture.
- * @param onLevelUpdate  Called with dBFS RMS level after each read burst (main thread NOT guaranteed).
+ * @param chunker             Destination sliding-window chunker.
+ * @param mediaProjection     Optional MediaProjection for system audio capture.
+ * @param onLevelUpdate       Called with dBFS RMS after each read burst.
+ * @param onCaptureSourceReady Called once with the actual capture source ("system"/"mic")
+ *                             and config label when recording starts.
+ * @param forceMic            If true, skip system audio and use microphone directly.
  */
 class AudioCaptureManager(
     private val chunker: AudioChunker,
     private val mediaProjection: MediaProjection? = null,
     private val onLevelUpdate: ((dbfs: Float) -> Unit)? = null,
+    private val onCaptureSourceReady: ((source: String, config: String) -> Unit)? = null,
     private val forceMic: Boolean = false
 ) {
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
+
+    // Actual capture params — set in start() once a valid config is found
+    private var actualSampleRate = 44_100
+    private var isStereo = false
 
     val isCapturing: Boolean get() = captureJob?.isActive == true
 
@@ -52,41 +68,68 @@ class AudioCaptureManager(
     fun start() {
         if (isCapturing) return
 
-        val minBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE_CAPTURE, CHANNEL_CONFIG, AUDIO_FORMAT)
-            .takeIf { it > 0 } ?: (SAMPLE_RATE_CAPTURE / 5 * 2)
+        val record: AudioRecord?
+        val sourceLabel: String
+        val configLabel: String
 
-        val record = if (!forceMic && mediaProjection != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val sys = buildSystemAudioRecord(mediaProjection, minBufSize)
-            if (sys != null) {
-                Log.i(TAG, "✓ 시스템 오디오 캡처 활성화 (MediaProjection)")
+        if (!forceMic && mediaProjection != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val result = buildSystemAudioRecord(mediaProjection)
+            if (result != null) {
+                record = result.first
+                actualSampleRate = result.second
+                isStereo = result.third
+                sourceLabel = "system"
+                configLabel = "${if (isStereo) "stereo" else "mono"} ${actualSampleRate / 1000}kHz"
+                Log.i(TAG, "✓ 시스템 오디오 캡처 활성화 ($configLabel)")
             } else {
-                Log.w(TAG, "✗ 시스템 오디오 실패 → 마이크로 폴백")
+                Log.w(TAG, "✗ 모든 시스템 오디오 설정 실패 → 마이크로 폴백")
+                val micResult = buildMicRecord()
+                record = micResult?.first
+                actualSampleRate = micResult?.second ?: 44_100
+                isStereo = false
+                sourceLabel = "mic(fallback)"
+                configLabel = "mic"
             }
-            sys ?: buildMicRecord(minBufSize)
         } else {
-            Log.i(TAG, if (forceMic) "강제 마이크 모드" else "MediaProjection 없음 → 마이크 사용")
-            buildMicRecord(minBufSize)
+            val reason = if (forceMic) "강제 마이크 모드" else "MediaProjection 없음 → 마이크 사용"
+            Log.i(TAG, reason)
+            val micResult = buildMicRecord()
+            record = micResult?.first
+            actualSampleRate = micResult?.second ?: 44_100
+            isStereo = false
+            sourceLabel = "mic"
+            configLabel = "mic"
         }
 
         if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord 초기화 실패")
+            Log.e(TAG, "AudioRecord 초기화 실패 (state=${record?.state})")
             record?.release()
+            onCaptureSourceReady?.invoke("error", "초기화 실패")
             return
         }
 
         audioRecord = record
         record.startRecording()
-        Log.i(TAG, "AudioRecord 시작 (srcRate=$SAMPLE_RATE_CAPTURE → asrRate=$SAMPLE_RATE_ASR)")
+        Log.i(TAG, "AudioRecord 녹음 시작: source=$sourceLabel sampleRate=$actualSampleRate stereo=$isStereo")
+        onCaptureSourceReady?.invoke(sourceLabel, configLabel)
 
-        val readBuffer = ByteArray(minBufSize)
+        val bufSize = AudioRecord.getMinBufferSize(actualSampleRate,
+            if (isStereo) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO,
+            AUDIO_FORMAT).takeIf { it > 0 } ?: (actualSampleRate / 5 * (if (isStereo) 4 else 2))
+        val readBuffer = ByteArray(bufSize * 4)
 
         captureJob = scope.launch {
             while (isActive) {
                 val bytesRead = record.read(readBuffer, 0, readBuffer.size)
-                if (bytesRead <= 0) continue
+                if (bytesRead <= 0) {
+                    Log.v(TAG, "read() returned $bytesRead — skipping")
+                    continue
+                }
 
-                val float32   = PcmConverter.int16BytesToFloat32(readBuffer, bytesRead)
-                val resampled = PcmConverter.downsample(float32, SAMPLE_RATE_CAPTURE, SAMPLE_RATE_ASR)
+                var float32 = PcmConverter.int16BytesToFloat32(readBuffer, bytesRead)
+                if (isStereo) float32 = PcmConverter.stereoToMono(float32)
+
+                val resampled = PcmConverter.downsample(float32, actualSampleRate, SAMPLE_RATE_ASR)
 
                 onLevelUpdate?.invoke(computeDbfs(float32))
                 chunker.feed(resampled)
@@ -107,46 +150,83 @@ class AudioCaptureManager(
     // Private builders
     // -------------------------------------------------------------------------
 
+    /**
+     * Try each (sampleRate, channelMask) config in [SYSTEM_AUDIO_CONFIGS] until one succeeds.
+     * Returns Triple(audioRecord, sampleRate, isStereo) or null if all fail.
+     *
+     * IMPORTANT: AudioRecord.Builder().build() does NOT throw on failure — it can return
+     * a record in STATE_UNINITIALIZED. Always validate state before returning.
+     */
     @RequiresApi(Build.VERSION_CODES.Q)
     @SuppressLint("MissingPermission")
-    private fun buildSystemAudioRecord(projection: MediaProjection, bufSize: Int): AudioRecord? =
-        try {
-            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
+    private fun buildSystemAudioRecord(projection: MediaProjection): Triple<AudioRecord, Int, Boolean>? {
+        val captureConfig = try {
+            AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_UNKNOWN)
                 .build()
-
-            AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(captureConfig)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AUDIO_FORMAT)
-                        .setSampleRate(SAMPLE_RATE_CAPTURE)
-                        .setChannelMask(CHANNEL_CONFIG)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufSize * 4)
-                .build()
         } catch (e: Exception) {
-            Log.e(TAG, "System AudioRecord failed, will try mic", e)
-            null
+            Log.e(TAG, "AudioPlaybackCaptureConfiguration 생성 실패: ${e.message}")
+            return null
         }
+
+        for ((rate, channel, label) in SYSTEM_AUDIO_CONFIGS) {
+            try {
+                val minBuf = AudioRecord.getMinBufferSize(rate, channel, AUDIO_FORMAT)
+                    .takeIf { it > 0 } ?: (rate / 5 * if (channel == AudioFormat.CHANNEL_IN_STEREO) 4 else 2)
+
+                val ar = AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(captureConfig)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AUDIO_FORMAT)
+                            .setSampleRate(rate)
+                            .setChannelMask(channel)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBuf * 4)
+                    .build()
+
+                if (ar.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "시스템 오디오 설정 성공: $label (minBuf=$minBuf)")
+                    return Triple(ar, rate, channel == AudioFormat.CHANNEL_IN_STEREO)
+                } else {
+                    Log.w(TAG, "시스템 오디오 $label: STATE_UNINITIALIZED — 다음 시도")
+                    ar.release()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "시스템 오디오 $label 예외: ${e.message}")
+            }
+        }
+
+        Log.e(TAG, "모든 시스템 오디오 설정 실패")
+        return null
+    }
 
     @SuppressLint("MissingPermission")
-    private fun buildMicRecord(bufSize: Int): AudioRecord? =
-        try {
-            AudioRecord(
+    private fun buildMicRecord(): Pair<AudioRecord, Int>? {
+        val rate = 44_100
+        val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT)
+            .takeIf { it > 0 } ?: (rate / 5 * 2)
+        return try {
+            val ar = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE_CAPTURE,
-                CHANNEL_CONFIG,
-                AUDIO_FORMAT,
-                bufSize * 4
+                rate, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT, minBuf * 4
             )
+            if (ar.state == AudioRecord.STATE_INITIALIZED) {
+                Log.i(TAG, "마이크 AudioRecord 초기화 성공")
+                Pair(ar, rate)
+            } else {
+                Log.e(TAG, "마이크 AudioRecord STATE_UNINITIALIZED")
+                ar.release()
+                null
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Mic AudioRecord failed", e)
+            Log.e(TAG, "마이크 AudioRecord 예외: ${e.message}")
             null
         }
+    }
 
     // -------------------------------------------------------------------------
     // Level metering

@@ -19,19 +19,23 @@ private const val TAG = "SubtitleOverlayManager"
 /** How long a subtitle remains fully visible before fading out (ms). */
 private const val SUBTITLE_DISPLAY_MS = 4_500L
 
+/** VAD threshold used for visual bar coloring — keep in sync with AudioCaptureService. */
+private const val VAD_THRESHOLD = 0.008f
+
+/** RMS level considered "loud" for bar scaling (corresponds to ~-20 dBFS). */
+private const val RMS_MAX_SCALE = 0.1f
+
+private const val BAR_LEN = 12
+
 /**
  * Manages the always-visible floating overlay window.
  *
- * Layout (bottom of screen):
+ * Debug panel layout (when debug mode is ON):
  * ```
- * ┌──────────────────────────────────┐
- * │   자막 텍스트 (fade-out 5초)      │  ← tvSubtitle  (GONE when empty)
- * │  [진단] ASR: "..." lang=en       │  ← tvDebug     (진단 모드 시 표시)
- * │  ● 듣는 중...  -42 dBFS          │  ← statusBar   (always visible)
- * └──────────────────────────────────┘
+ * 소스: 시스템(48k-stereo)  ASR: ✓  번역: ✗
+ * ████████░░░░ 0.0421  ▶ 소리 감지
+ * ASR: "Hello, this is a test"  lang=en
  * ```
- *
- * Requires [android.Manifest.permission.SYSTEM_ALERT_WINDOW].
  */
 class SubtitleOverlayManager(private val context: Context) {
 
@@ -50,15 +54,16 @@ class SubtitleOverlayManager(private val context: Context) {
 
     private var debugMode: Boolean = false
 
+    // Persists across showDebugInfo calls so the header line stays accurate
+    private var captureSourceLine = "소스: 대기 중"
+    private var engineStatusLine  = "ASR: -  번역: -"
+
     val isAttached: Boolean get() = overlayRoot != null
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    /**
-     * Inflate and add the overlay window. Idempotent.
-     */
     fun attach() {
         if (isAttached) return
 
@@ -91,9 +96,6 @@ class SubtitleOverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Remove the overlay window. Safe to call when not attached.
-     */
     fun detach() {
         mainHandler.removeCallbacksAndMessages(null)
         val root = overlayRoot ?: return
@@ -116,9 +118,6 @@ class SubtitleOverlayManager(private val context: Context) {
     // Public update API (all thread-safe via mainHandler)
     // -------------------------------------------------------------------------
 
-    /**
-     * Update the status bar indicator. Call at each pipeline stage transition.
-     */
     fun setState(state: PipelineState) {
         mainHandler.post {
             tvStatus?.text = state.label
@@ -127,31 +126,21 @@ class SubtitleOverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Show a subtitle. Fades out after [displayMs] ms. Thread-safe.
-     */
     fun showSubtitle(text: String, displayMs: Long = SUBTITLE_DISPLAY_MS) {
         if (text.isBlank()) return
         Log.d(TAG, "showSubtitle: \"$text\"")
         mainHandler.post {
             val tv = tvSubtitle ?: return@post
             cancelSubtitleFade()
-
             tv.text = text
             tv.alpha = 1f
             tv.visibility = View.VISIBLE
-
             subtitleHideRunnable = Runnable { fadeOutSubtitle() }.also {
                 mainHandler.postDelayed(it, displayMs)
             }
         }
     }
 
-    /**
-     * Show diagnostic information below the subtitle.
-     * Displays ASR raw text, detected language, RMS, and translation engine status.
-     * Call from AudioCaptureService during processChunk() for pipeline diagnosis.
-     */
     fun setDebugMode(enabled: Boolean) {
         debugMode = enabled
         mainHandler.post {
@@ -159,18 +148,55 @@ class SubtitleOverlayManager(private val context: Context) {
         }
     }
 
+    /**
+     * Called once after engines initialize. Updates the persistent header line in debug panel.
+     */
     fun showEngineStatus(asrReady: Boolean, translationReady: Boolean, audioSource: String) {
+        val src = when {
+            audioSource.startsWith("system") -> "시스템"
+            audioSource.startsWith("mic")    -> "마이크"
+            else                             -> audioSource
+        }
+        engineStatusLine = "소스: $src  ASR: ${if (asrReady) "✓" else "✗"}  번역: ${if (translationReady) "✓" else "✗"}"
         if (!debugMode) return
         mainHandler.post {
             val tv = tvDebug ?: return@post
-            val asrStatus = if (asrReady) "✓준비됨" else "✗없음"
-            val xlat = if (translationReady) "✓준비됨" else "✗없음"
-            val src = if (audioSource == "mic") "마이크" else "시스템"
-            tv.text = "ASR: $asrStatus  번역: $xlat  소스: $src"
+            tv.text = "$engineStatusLine\n$captureSourceLine"
             tv.visibility = View.VISIBLE
         }
     }
 
+    /**
+     * Called by AudioCaptureManager callback when actual capture source is confirmed.
+     * Shows the exact config that succeeded (e.g., "48k-stereo").
+     */
+    fun updateCaptureSource(source: String, config: String) {
+        captureSourceLine = when (source) {
+            "system"       -> "✓ 시스템 오디오 ($config)"
+            "mic(fallback)"-> "⚠ 마이크 폴백 (시스템 실패)"
+            "mic"          -> "✓ 마이크"
+            "error"        -> "✗ 캡처 초기화 실패"
+            else           -> source
+        }
+        if (!debugMode) return
+        mainHandler.post {
+            val tv = tvDebug ?: return@post
+            tv.text = "$engineStatusLine\n$captureSourceLine"
+            tv.visibility = View.VISIBLE
+        }
+    }
+
+    /**
+     * Called on every audio chunk. Shows real-time RMS bar and VAD status.
+     *
+     * Display format:
+     * ```
+     * 소스: 시스템  ASR: ✓  번역: ✗
+     * ✓ 시스템 오디오 (48k-stereo)
+     * ████████░░░░ 0.0421  ▶ 소리 감지
+     * ASR: "Hello, world"  lang=en
+     * ```
+     */
     fun showDebugInfo(
         rms: Float,
         asrText: String? = null,
@@ -180,22 +206,29 @@ class SubtitleOverlayManager(private val context: Context) {
         if (!debugMode) return
         mainHandler.post {
             val tv = tvDebug ?: return@post
+
+            // Visual RMS bar
+            val filled = ((rms / RMS_MAX_SCALE).coerceIn(0f, 1f) * BAR_LEN).toInt()
+            val bar = "█".repeat(filled) + "░".repeat(BAR_LEN - filled)
+
+            // VAD status with icon
+            val vadStatus = if (rms >= VAD_THRESHOLD) "▶ 소리 감지" else "⏸ 묵음"
+
             val sb = StringBuilder()
-            sb.append("RMS: ${"%.4f".format(rms)}")
+            sb.append(engineStatusLine)
+            sb.append("\n").append(captureSourceLine)
+            sb.append("\n$bar ${"%.4f".format(rms)}  $vadStatus")
+
             if (asrText != null) {
-                sb.append("  lang=${lang ?: "??"}")
-                sb.append("\nASR: \"${asrText.take(80)}\"")
+                val xlat = if (translationReady) "" else " [번역없음]"
+                sb.append("\nASR[${lang ?: "??"}]: \"${asrText.take(60)}\"$xlat")
             }
-            val xlat = if (translationReady) "번역OK" else "번역없음"
-            sb.append("  [$xlat]")
+
             tv.text = sb.toString()
             tv.visibility = View.VISIBLE
         }
     }
 
-    /**
-     * Update debug audio level meter.
-     */
     fun updateLevel(dbfs: Float) {
         mainHandler.post {
             val tv = tvLevel ?: return@post
