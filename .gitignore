@@ -31,5 +31,5 @@ crash_log.txt
 crash_*.txt
 
 # Claude Code temp files
-'$HOME'/.tmp/
+$HOME/
 .claude/
