@@ -19,6 +19,7 @@ import com.audiosub.model.ModelDownloadManager.DownloadWorker.Companion.PHASE_DO
 import com.audiosub.model.ModelDownloadManager.DownloadWorker.Companion.PHASE_EXTRACT
 import com.audiosub.model.ModelManagerActivity
 import com.audiosub.model.ModelRegistry
+import com.audiosub.overlay.SubtitleOverlayManager
 import com.audiosub.service.AudioCaptureService
 import com.audiosub.util.PermissionHelper
 
@@ -73,6 +74,10 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnModelManager.setOnClickListener {
             startActivity(Intent(this, ModelManagerActivity::class.java))
+        }
+
+        binding.btnTestSubtitle.setOnClickListener {
+            testSubtitleOverlay()
         }
 
         try {
@@ -214,6 +219,35 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+    }
+
+    // -------------------------------------------------------------------------
+    // Subtitle overlay test
+    // -------------------------------------------------------------------------
+
+    /**
+     * Directly tests the overlay without ASR or translation.
+     * Shows a Korean test subtitle to verify the WindowManager overlay works.
+     */
+    private fun testSubtitleOverlay() {
+        if (!PermissionHelper.canDrawOverlays(this)) {
+            Toast.makeText(this, "오버레이 권한이 없습니다. '오버레이 권한' 버튼을 먼저 눌러주세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val testOverlay = SubtitleOverlayManager(this)
+        testOverlay.attach()
+        testOverlay.showSubtitle("자막 테스트: 오버레이가 정상 작동합니다 ✓")
+        testOverlay.showDebugInfo(
+            rms = 0.042f,
+            asrText = "This is a subtitle overlay test",
+            lang = "en",
+            translationReady = false
+        )
+        // Auto-detach after 6 seconds
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            testOverlay.detach()
+        }, 6_000L)
+        showStatus("자막 테스트 중 — 6초 후 자동 종료")
     }
 
     // -------------------------------------------------------------------------

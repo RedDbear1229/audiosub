@@ -26,7 +26,7 @@ private const val SUBTITLE_DISPLAY_MS = 4_500L
  * ```
  * ┌──────────────────────────────────┐
  * │   자막 텍스트 (fade-out 5초)      │  ← tvSubtitle  (GONE when empty)
- * │                                  │
+ * │  [진단] ASR: "..." lang=en       │  ← tvDebug     (진단 모드 시 표시)
  * │  ● 듣는 중...  -42 dBFS          │  ← statusBar   (always visible)
  * └──────────────────────────────────┘
  * ```
@@ -42,6 +42,7 @@ class SubtitleOverlayManager(private val context: Context) {
     private var tvSubtitle: TextView? = null
     private var tvStatus: TextView? = null
     private var tvLevel: TextView? = null
+    private var tvDebug: TextView? = null
     private var statusDot: View? = null
 
     private var fadeAnimator: ObjectAnimator? = null
@@ -63,6 +64,7 @@ class SubtitleOverlayManager(private val context: Context) {
         tvSubtitle = root.findViewById(R.id.tvSubtitle)
         tvStatus   = root.findViewById(R.id.tvStatus)
         tvLevel    = root.findViewById(R.id.tvLevel)
+        tvDebug    = root.findViewById(R.id.tvDebug)
         statusDot  = root.findViewById(R.id.statusDot)
 
         val params = WindowManager.LayoutParams(
@@ -75,7 +77,7 @@ class SubtitleOverlayManager(private val context: Context) {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 80 // dp from bottom — WindowManager uses px but this is fine for bottom gravity
+            y = 80
         }
 
         try {
@@ -103,6 +105,7 @@ class SubtitleOverlayManager(private val context: Context) {
             tvSubtitle = null
             tvStatus = null
             tvLevel = null
+            tvDebug = null
             statusDot = null
         }
     }
@@ -127,6 +130,7 @@ class SubtitleOverlayManager(private val context: Context) {
      */
     fun showSubtitle(text: String, displayMs: Long = SUBTITLE_DISPLAY_MS) {
         if (text.isBlank()) return
+        Log.d(TAG, "showSubtitle: \"$text\"")
         mainHandler.post {
             val tv = tvSubtitle ?: return@post
             cancelSubtitleFade()
@@ -142,7 +146,33 @@ class SubtitleOverlayManager(private val context: Context) {
     }
 
     /**
-     * Update debug audio level meter (hidden in production builds).
+     * Show diagnostic information below the subtitle.
+     * Displays ASR raw text, detected language, RMS, and translation engine status.
+     * Call from AudioCaptureService during processChunk() for pipeline diagnosis.
+     */
+    fun showDebugInfo(
+        rms: Float,
+        asrText: String? = null,
+        lang: String? = null,
+        translationReady: Boolean = false
+    ) {
+        mainHandler.post {
+            val tv = tvDebug ?: return@post
+            val sb = StringBuilder()
+            sb.append("RMS: ${"%.4f".format(rms)}")
+            if (asrText != null) {
+                sb.append("  lang=${lang ?: "??"}")
+                sb.append("\nASR: \"${asrText.take(80)}\"")
+            }
+            val xlat = if (translationReady) "번역OK" else "번역없음"
+            sb.append("  [$xlat]")
+            tv.text = sb.toString()
+            tv.visibility = View.VISIBLE
+        }
+    }
+
+    /**
+     * Update debug audio level meter.
      */
     fun updateLevel(dbfs: Float) {
         mainHandler.post {

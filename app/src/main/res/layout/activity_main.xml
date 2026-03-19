@@ -56,4 +56,12 @@
         android:layout_marginTop="8dp"
         android:text="모델 관리" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnTestSubtitle"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="200dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="자막 테스트" />
+
 </LinearLayout>

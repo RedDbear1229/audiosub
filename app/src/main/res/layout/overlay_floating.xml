@@ -11,7 +11,7 @@
         android:id="@+id/tvSubtitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"
+        android:layout_marginBottom="4dp"
         android:background="@drawable/subtitle_bg"
         android:gravity="center"
         android:lineSpacingMultiplier="1.25"
@@ -21,6 +21,23 @@
         android:text=""
         android:textColor="@color/subtitle_text"
         android:textSize="20sp"
+        android:visibility="gone" />
+
+    <!-- Debug info row: ASR raw text / RMS / language — visible during diagnosis -->
+    <TextView
+        android:id="@+id/tvDebug"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="6dp"
+        android:background="#AA000000"
+        android:fontFamily="monospace"
+        android:gravity="start"
+        android:maxLines="3"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="4dp"
+        android:text=""
+        android:textColor="#DDFFFFFF"
+        android:textSize="10sp"
         android:visibility="gone" />
 
     <!-- Status bar — always visible while service is running -->

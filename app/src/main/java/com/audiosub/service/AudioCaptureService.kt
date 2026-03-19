@@ -253,33 +253,63 @@ class AudioCaptureService : LifecycleService() {
 
     private suspend fun processChunk(chunk: FloatArray) {
         val asr = asrEngine
-        if (asr == null || !asr.isReady) return
+        if (asr == null || !asr.isReady) {
+            Log.w(TAG, "processChunk: ASR 엔진 미준비 (null=${asr == null})")
+            return
+        }
 
         // Energy-based VAD: skip silence to prevent Whisper hallucinations.
-        // RMS threshold of 0.008 corresponds to ~-42 dBFS — below this is silence.
         val rms = computeRms(chunk)
+
+        // 항상 debug overlay에 RMS 표시 → 오디오 입력이 되는지 화면에서 확인 가능
+        overlay.showDebugInfo(rms = rms, translationReady = translationEngine?.isReady == true)
+
         if (rms < VAD_RMS_THRESHOLD) {
-            Log.v(TAG, "VAD: silence (rms=${"%.4f".format(rms)}) — skip")
+            Log.v(TAG, "VAD: 묵음 (rms=${"%.4f".format(rms)}) — skip")
             overlay.setState(PipelineState.LISTENING)
             return
         }
-        Log.d(TAG, "VAD: speech detected (rms=${"%.4f".format(rms)})")
+        Log.i(TAG, "VAD: 음성 감지 (rms=${"%.4f".format(rms)}, samples=${chunk.size})")
 
         overlay.setState(PipelineState.TRANSCRIBING)
         val result = asr.transcribe(chunk)
-        Log.d(TAG, "ASR: \"${result.text}\" [lang=${result.language}]")
+        Log.i(TAG, "ASR 결과: \"${result.text}\" [lang=${result.language}] [empty=${result.isEmpty}]")
 
-        if (result.isEmpty || isHallucination(result.text)) {
+        // ASR 결과를 debug overlay에 즉시 표시
+        overlay.showDebugInfo(
+            rms = rms,
+            asrText = result.text,
+            lang = result.language,
+            translationReady = translationEngine?.isReady == true
+        )
+
+        if (result.isEmpty) {
+            Log.d(TAG, "ASR: 빈 결과 — skip")
+            overlay.setState(PipelineState.LISTENING)
+            return
+        }
+        if (isHallucination(result.text)) {
+            Log.d(TAG, "ASR: 환각 필터됨 \"${result.text}\"")
             overlay.setState(PipelineState.LISTENING)
             return
         }
 
         val lang = result.language ?: "en"
-        val subtitle = if (lang == "ko") {
-            result.text
+        val subtitle: String
+        if (lang == "ko") {
+            subtitle = result.text
+            Log.i(TAG, "언어=ko → 번역 생략, 원문 표시")
         } else {
-            overlay.setState(PipelineState.TRANSLATING)
-            translateOrFallback(result.text, lang)
+            val engine = translationEngine
+            if (engine != null && engine.isReady) {
+                overlay.setState(PipelineState.TRANSLATING)
+                subtitle = translateOrFallback(result.text, lang)
+                Log.i(TAG, "번역 완료: \"$subtitle\"")
+            } else {
+                // 번역 엔진 미준비 → 원문을 언어 레이블과 함께 표시
+                subtitle = "[${lang.uppercase()}] ${result.text}"
+                Log.i(TAG, "번역 엔진 없음 → 원문 표시 (lang=$lang)")
+            }
         }
 
         overlay.setState(PipelineState.LISTENING)
