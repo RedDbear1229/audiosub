@@ -61,6 +61,7 @@ class AudioCaptureManager(
     // Actual capture params — set in start() once a valid config is found
     private var actualSampleRate = 44_100
     private var isStereo = false
+    private var readCount = 0  // 초기 진단용 카운터
 
     val isCapturing: Boolean get() = captureJob?.isActive == true
 
@@ -129,6 +130,21 @@ class AudioCaptureManager(
                 var float32 = PcmConverter.int16BytesToFloat32(readBuffer, bytesRead)
                 if (isStereo) float32 = PcmConverter.stereoToMono(float32)
 
+                // 처음 10회 read 동안 raw 데이터 진단 로그 출력
+                readCount++
+                if (readCount <= 10) {
+                    val maxSample = float32.maxOrNull() ?: 0f
+                    val minSample = float32.minOrNull() ?: 0f
+                    val rms = sqrt(float32.sumOf { (it * it).toDouble() }.toFloat() / float32.size)
+                    val allZero = float32.all { it == 0f }
+                    Log.i(TAG, "RAW[${readCount}] samples=${float32.size} " +
+                        "min=${"%.6f".format(minSample)} max=${"%.6f".format(maxSample)} " +
+                        "rms=${"%.6f".format(rms)} allZero=$allZero stereo=$isStereo")
+                    if (readCount == 10 && allZero) {
+                        Log.e(TAG, "⚠ 처음 10회 read가 모두 0 — 오디오 입력 없음!")
+                    }
+                }
+
                 val resampled = PcmConverter.downsample(float32, actualSampleRate, SAMPLE_RATE_ASR)
 
                 onLevelUpdate?.invoke(computeDbfs(float32))
@@ -165,6 +181,10 @@ class AudioCaptureManager(
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(android.media.AudioAttributes.USAGE_UNKNOWN)
+                .addMatchingUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .addMatchingUsage(android.media.AudioAttributes.USAGE_ALARM)
+                .addMatchingUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                .addMatchingUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
                 .build()
         } catch (e: Exception) {
             Log.e(TAG, "AudioPlaybackCaptureConfiguration 생성 실패: ${e.message}")

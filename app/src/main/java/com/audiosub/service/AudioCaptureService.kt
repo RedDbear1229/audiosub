@@ -296,10 +296,15 @@ class AudioCaptureService : LifecycleService() {
 
         // Energy-based VAD: skip silence to prevent Whisper hallucinations.
         val rms = computeRms(chunk)
+        val allZero = chunk.all { it == 0f }
 
         // RMS 표시 — debug 모드일 때만
         if (isDebugMode) {
-            overlay.showDebugInfo(rms = rms, translationReady = translationEngine?.isReady == true)
+            overlay.showDebugInfo(
+                rms = rms,
+                translationReady = translationEngine?.isReady == true,
+                extraInfo = if (allZero) "⚠ 오디오 데이터 0 (캡처 차단?)" else "samples=${chunk.size}"
+            )
         }
 
         if (rms < VAD_RMS_THRESHOLD) {

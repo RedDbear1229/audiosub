@@ -201,7 +201,8 @@ class SubtitleOverlayManager(private val context: Context) {
         rms: Float,
         asrText: String? = null,
         lang: String? = null,
-        translationReady: Boolean = false
+        translationReady: Boolean = false,
+        extraInfo: String? = null
     ) {
         if (!debugMode) return
         mainHandler.post {
@@ -218,6 +219,7 @@ class SubtitleOverlayManager(private val context: Context) {
             sb.append(engineStatusLine)
             sb.append("\n").append(captureSourceLine)
             sb.append("\n$bar ${"%.4f".format(rms)}  $vadStatus")
+            if (extraInfo != null) sb.append("\n$extraInfo")
 
             if (asrText != null) {
                 val xlat = if (translationReady) "" else " [번역없음]"
