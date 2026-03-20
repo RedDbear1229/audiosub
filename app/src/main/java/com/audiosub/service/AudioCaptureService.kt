@@ -81,6 +81,10 @@ class AudioCaptureService : LifecycleService() {
     private var isDebugMode: Boolean = false
     private var audioSource: String = AUDIO_SOURCE_SYSTEM
 
+    // 연속 묵음 카운터 — 일정 횟수 이상이면 오디오 차단 경고 표시
+    private var silentChunkCount = 0
+    private val SILENCE_WARN_CHUNKS = 15  // 약 30초 (청크당 2s)
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -299,10 +303,20 @@ class AudioCaptureService : LifecycleService() {
         }
 
         if (rms < VAD_RMS_THRESHOLD) {
-            Log.v(TAG, "VAD: 묵음 (rms=${"%.4f".format(rms)}) — skip")
+            silentChunkCount++
+            Log.v(TAG, "VAD: 묵음 (rms=${"%.4f".format(rms)}, 연속=${silentChunkCount}회) — skip")
+            if (silentChunkCount == SILENCE_WARN_CHUNKS) {
+                val msg = if (audioSource == AUDIO_SOURCE_SYSTEM)
+                    "⚠ 소리 없음 — 앱이 오디오 캡처 차단 중일 수 있음\n(YouTube 등 DRM 앱은 차단됨)"
+                else
+                    "⚠ 마이크 입력 없음 — 마이크 권한 또는 소리 확인"
+                overlay.showSilenceWarning(msg)
+                Log.w(TAG, "지속적 묵음 경고: $msg")
+            }
             overlay.setState(PipelineState.LISTENING)
             return
         }
+        silentChunkCount = 0  // 소리 감지 시 카운터 리셋
         Log.i(TAG, "VAD: 음성 감지 (rms=${"%.4f".format(rms)}, samples=${chunk.size})")
 
         overlay.setState(PipelineState.TRANSCRIBING)

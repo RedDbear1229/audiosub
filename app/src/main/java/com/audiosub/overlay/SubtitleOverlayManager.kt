@@ -229,6 +229,14 @@ class SubtitleOverlayManager(private val context: Context) {
         }
     }
 
+    /**
+     * Shows a warning subtitle when audio has been silent for too long.
+     * Visible regardless of debug mode — indicates a likely audio capture blockage.
+     */
+    fun showSilenceWarning(message: String) {
+        showSubtitle(message, displayMs = 8_000L)
+    }
+
     fun updateLevel(dbfs: Float) {
         mainHandler.post {
             val tv = tvLevel ?: return@post
