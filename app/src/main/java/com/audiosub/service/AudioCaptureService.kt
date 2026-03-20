@@ -145,7 +145,7 @@ class AudioCaptureService : LifecycleService() {
      * Called AFTER startForeground() so Android 14+ constraint is satisfied.
      */
     private fun acquireMediaProjection(intent: Intent?): MediaProjection? {
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         @Suppress("DEPRECATION")
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
             intent?.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
@@ -154,7 +154,7 @@ class AudioCaptureService : LifecycleService() {
 
         Log.i(TAG, "acquireMediaProjection: resultCode=$resultCode data=${data != null} intent=${intent != null}")
 
-        if (resultCode == -1 || data == null) {
+        if (resultCode != android.app.Activity.RESULT_OK || data == null) {
             Log.w(TAG, "No projection data in Intent (code=$resultCode, data=$data)")
             if (isDebugMode) overlay.updateCaptureSource("error", "MP 데이터 없음 (code=$resultCode)")
             return MediaProjectionHolder.get()

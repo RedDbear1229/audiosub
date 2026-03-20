@@ -7,8 +7,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
@@ -58,6 +60,18 @@ class SubtitleOverlayManager(private val context: Context) {
     private var captureSourceLine = "소스: 대기 중"
     private var engineStatusLine  = "ASR: -  번역: -"
 
+    // Drag state
+    private var isDragging = false
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    private var dragStartParamX = 0
+    private var dragStartParamY = 0
+    private var layoutParams: WindowManager.LayoutParams? = null
+
+    private val prefs by lazy {
+        context.getSharedPreferences("audiosub_overlay_prefs", Context.MODE_PRIVATE)
+    }
+
     val isAttached: Boolean get() = overlayRoot != null
 
     // -------------------------------------------------------------------------
@@ -74,23 +88,32 @@ class SubtitleOverlayManager(private val context: Context) {
         tvDebug    = root.findViewById(R.id.tvDebug)
         statusDot  = root.findViewById(R.id.statusDot)
 
+        val hasSavedPos = prefs.contains("overlay_x")
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                     or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 80
+            if (hasSavedPos) {
+                gravity = Gravity.TOP or Gravity.START
+                x = prefs.getInt("overlay_x", 0)
+                y = prefs.getInt("overlay_y", 0)
+            } else {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                y = 80
+            }
         }
+        layoutParams = params
+
+        setupTouchHandling(root)
 
         try {
             windowManager.addView(root, params)
             overlayRoot = root
-            Log.i(TAG, "Overlay attached")
+            Log.i(TAG, "Overlay attached (savedPos=$hasSavedPos)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to attach overlay", e)
         }
@@ -111,6 +134,68 @@ class SubtitleOverlayManager(private val context: Context) {
             tvLevel = null
             tvDebug = null
             statusDot = null
+            layoutParams = null
+            isDragging = false
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Drag handling
+    // -------------------------------------------------------------------------
+
+    @Suppress("ClickableViewAccessibility")
+    private fun setupTouchHandling(root: View) {
+        val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onLongPress(e: MotionEvent) {
+                isDragging = true
+                dragStartX = e.rawX
+                dragStartY = e.rawY
+                val lp = layoutParams ?: return
+                // Convert gravity-based position to absolute coordinates if needed
+                if (lp.gravity != (Gravity.TOP or Gravity.START)) {
+                    val location = IntArray(2)
+                    root.getLocationOnScreen(location)
+                    lp.gravity = Gravity.TOP or Gravity.START
+                    lp.x = location[0]
+                    lp.y = location[1]
+                    try { windowManager.updateViewLayout(root, lp) } catch (_: Exception) {}
+                }
+                dragStartParamX = lp.x
+                dragStartParamY = lp.y
+                // Haptic feedback + scale up
+                root.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                root.animate().scaleX(1.05f).scaleY(1.05f).setDuration(150).start()
+                Log.d(TAG, "Drag started at (${lp.x}, ${lp.y})")
+            }
+        })
+
+        root.setOnTouchListener { v, event ->
+            gestureDetector.onTouchEvent(event)
+            if (isDragging) {
+                when (event.action) {
+                    MotionEvent.ACTION_MOVE -> {
+                        val lp = layoutParams ?: return@setOnTouchListener false
+                        lp.x = dragStartParamX + (event.rawX - dragStartX).toInt()
+                        lp.y = dragStartParamY + (event.rawY - dragStartY).toInt()
+                        try { windowManager.updateViewLayout(v, lp) } catch (_: Exception) {}
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isDragging = false
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(150).start()
+                        val lp = layoutParams
+                        if (lp != null) {
+                            prefs.edit()
+                                .putInt("overlay_x", lp.x)
+                                .putInt("overlay_y", lp.y)
+                                .apply()
+                            Log.d(TAG, "Drag ended, saved position (${lp.x}, ${lp.y})")
+                        }
+                    }
+                }
+                true
+            } else {
+                false
+            }
         }
     }
 

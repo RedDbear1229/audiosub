@@ -43,6 +43,14 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    packaging {
+        jniLibs {
+            // sherpa-onnx and onnxruntime-android both bundle libonnxruntime.so.
+            // Keep sherpa-onnx's version (already in jniLibs/arm64-v8a/) by picking first.
+            pickFirst("**/libonnxruntime.so")
+        }
+    }
 }
 
 dependencies {
@@ -57,6 +65,8 @@ dependencies {
     implementation(libs.recyclerview)
     // sherpa-onnx: local JAR (Java API) + .so files in jniLibs/arm64-v8a/
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
+    // ONNX Runtime Java API for NLLB inference (native .so already provided by sherpa-onnx)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext)
