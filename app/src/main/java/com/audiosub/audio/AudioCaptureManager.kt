@@ -173,54 +173,67 @@ class AudioCaptureManager(
      * IMPORTANT: AudioRecord.Builder().build() does NOT throw on failure — it can return
      * a record in STATE_UNINITIALIZED. Always validate state before returning.
      */
+    /**
+     * Try progressively simpler USAGE configs until one works.
+     * Some devices (esp. Samsung) reject certain usage combinations.
+     */
     @RequiresApi(Build.VERSION_CODES.Q)
     @SuppressLint("MissingPermission")
     private fun buildSystemAudioRecord(projection: MediaProjection): Triple<AudioRecord, Int, Boolean>? {
-        val captureConfig = try {
-            AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_UNKNOWN)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_ALARM)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
-                .addMatchingUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
-                .build()
-        } catch (e: Exception) {
-            Log.e(TAG, "AudioPlaybackCaptureConfiguration 생성 실패: ${e.message}")
-            return null
-        }
+        // Ordered from broad to minimal — first success wins
+        val usageConfigs = listOf(
+            "all" to listOf(
+                android.media.AudioAttributes.USAGE_MEDIA,
+                android.media.AudioAttributes.USAGE_GAME,
+                android.media.AudioAttributes.USAGE_UNKNOWN
+            ),
+            "media-only" to listOf(
+                android.media.AudioAttributes.USAGE_MEDIA
+            )
+        )
 
-        for ((rate, channel, label) in SYSTEM_AUDIO_CONFIGS) {
-            try {
-                val minBuf = AudioRecord.getMinBufferSize(rate, channel, AUDIO_FORMAT)
-                    .takeIf { it > 0 } ?: (rate / 5 * if (channel == AudioFormat.CHANNEL_IN_STEREO) 4 else 2)
-
-                val ar = AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(captureConfig)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AUDIO_FORMAT)
-                            .setSampleRate(rate)
-                            .setChannelMask(channel)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(minBuf * 4)
-                    .build()
-
-                if (ar.state == AudioRecord.STATE_INITIALIZED) {
-                    Log.i(TAG, "시스템 오디오 설정 성공: $label (minBuf=$minBuf)")
-                    return Triple(ar, rate, channel == AudioFormat.CHANNEL_IN_STEREO)
-                } else {
-                    Log.w(TAG, "시스템 오디오 $label: STATE_UNINITIALIZED — 다음 시도")
-                    ar.release()
-                }
+        for ((usageLabel, usages) in usageConfigs) {
+            val captureConfig = try {
+                val builder = AudioPlaybackCaptureConfiguration.Builder(projection)
+                for (u in usages) builder.addMatchingUsage(u)
+                builder.build()
             } catch (e: Exception) {
-                Log.w(TAG, "시스템 오디오 $label 예외: ${e.message}")
+                Log.w(TAG, "APCC 생성 실패 ($usageLabel): ${e.message}")
+                continue
+            }
+            Log.i(TAG, "APCC 생성 성공: $usageLabel (usages=${usages.size})")
+
+            for ((rate, channel, label) in SYSTEM_AUDIO_CONFIGS) {
+                try {
+                    val minBuf = AudioRecord.getMinBufferSize(rate, channel, AUDIO_FORMAT)
+                        .takeIf { it > 0 } ?: (rate / 5 * if (channel == AudioFormat.CHANNEL_IN_STEREO) 4 else 2)
+
+                    val ar = AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(captureConfig)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AUDIO_FORMAT)
+                                .setSampleRate(rate)
+                                .setChannelMask(channel)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(minBuf * 4)
+                        .build()
+
+                    if (ar.state == AudioRecord.STATE_INITIALIZED) {
+                        Log.i(TAG, "✓ 시스템 오디오 성공: $usageLabel/$label (minBuf=$minBuf)")
+                        return Triple(ar, rate, channel == AudioFormat.CHANNEL_IN_STEREO)
+                    } else {
+                        Log.w(TAG, "시스템 오디오 $usageLabel/$label: STATE_UNINITIALIZED")
+                        ar.release()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "시스템 오디오 $usageLabel/$label 예외: ${e.message}")
+                }
             }
         }
 
-        Log.e(TAG, "모든 시스템 오디오 설정 실패")
+        Log.e(TAG, "모든 시스템 오디오 설정 실패 (${usageConfigs.size} usage × ${SYSTEM_AUDIO_CONFIGS.size} format = 전부 실패)")
         return null
     }
 

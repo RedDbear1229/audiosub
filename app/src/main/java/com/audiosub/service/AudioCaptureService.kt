@@ -108,6 +108,7 @@ class AudioCaptureService : LifecycleService() {
                 NOTIFICATION_ID,
                 buildNotification(),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
         } else {
             startForeground(NOTIFICATION_ID, buildNotification())
@@ -151,14 +152,18 @@ class AudioCaptureService : LifecycleService() {
         else
             intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
 
+        Log.i(TAG, "acquireMediaProjection: resultCode=$resultCode data=${data != null} intent=${intent != null}")
+
         if (resultCode == -1 || data == null) {
-            Log.w(TAG, "No projection data in Intent — mic fallback")
-            return MediaProjectionHolder.get() // fall back to previously stored (if any)
+            Log.w(TAG, "No projection data in Intent (code=$resultCode, data=$data)")
+            if (isDebugMode) overlay.updateCaptureSource("error", "MP 데이터 없음 (code=$resultCode)")
+            return MediaProjectionHolder.get()
         }
 
         return try {
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val mp = pm.getMediaProjection(resultCode, data)
+            Log.i(TAG, "getMediaProjection 성공: mp=$mp")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 mp.registerCallback(object : MediaProjection.Callback() {
                     override fun onStop() {
@@ -168,11 +173,11 @@ class AudioCaptureService : LifecycleService() {
                 }, Handler(Looper.getMainLooper()))
             }
             MediaProjectionHolder.set(mp)
-            Log.i(TAG, "MediaProjection acquired in service")
             mp
         } catch (e: Exception) {
-            Log.e(TAG, "getMediaProjection failed in service: ${e.javaClass.simpleName}: ${e.message}", e)
+            Log.e(TAG, "getMediaProjection failed: ${e.javaClass.simpleName}: ${e.message}", e)
             writeCrashLog("acquireMediaProjection", e)
+            if (isDebugMode) overlay.updateCaptureSource("error", "MP 실패: ${e.message?.take(40)}")
             null
         }
     }
