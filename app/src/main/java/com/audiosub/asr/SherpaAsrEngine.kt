@@ -1,6 +1,8 @@
 package com.audiosub.asr
 
+import android.app.Application
 import android.util.Log
+import com.audiosub.AudioSubApp
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
@@ -17,7 +19,7 @@ private const val TAG = "SherpaAsrEngine"
  *
  * @param modelDir Directory containing the whisper encoder/decoder ONNX files and tokens.txt.
  */
-class SherpaAsrEngine(modelDir: File) : AsrEngine {
+class SherpaAsrEngine(modelDir: File, private val app: Application? = null) : AsrEngine {
 
     private var recognizer: OfflineRecognizer? = null
 
@@ -56,7 +58,7 @@ class SherpaAsrEngine(modelDir: File) : AsrEngine {
             val modelCfg = OfflineModelConfig.Builder()
                 .setWhisper(whisperCfg)
                 .setTokens(tokensPath)
-                .setNumThreads(2)
+                .setNumThreads(1)   // 1 thread: less memory pressure, avoids native race conditions
                 .setDebug(false)
                 .setProvider("cpu")
                 .build()
@@ -81,19 +83,32 @@ class SherpaAsrEngine(modelDir: File) : AsrEngine {
     override suspend fun transcribe(pcmFloat: FloatArray): AsrResult =
         withContext(CoroutineDispatcherProvider.asr) {
             val rec = recognizer ?: return@withContext AsrResult("")
+            // Clamp input to 30s max (480000 samples at 16kHz) — Whisper's hard limit
+            val input = if (pcmFloat.size > 480_000) {
+                Log.w(TAG, "청크 너무 큼 (${pcmFloat.size} samples) → 480000으로 자름")
+                pcmFloat.copyOf(480_000)
+            } else pcmFloat
+
+            var stream: com.k2fsa.sherpa.onnx.OfflineStream? = null
             try {
-                val stream = rec.createStream()
-                stream.acceptWaveform(pcmFloat, 16000)
+                // Record operation so native crash can be detected on next start
+                AudioSubApp.markOperation(app, "TRANSCRIBING samples=${input.size}")
+                stream = rec.createStream()
+                stream.acceptWaveform(input, 16000)
                 rec.decode(stream)
                 val result = rec.getResult(stream)
-                stream.release()
+                AudioSubApp.markOperation(app, null) // success — clear marker
                 AsrResult(
                     text = result.text.trim(),
                     language = result.lang.ifBlank { null }
                 )
             } catch (e: Exception) {
-                Log.e(TAG, "Transcription error", e)
+                Log.e(TAG, "전사 오류: ${e.javaClass.simpleName}: ${e.message}")
+                AudioSubApp.markOperation(app, null)
                 AsrResult("")
+            } finally {
+                // Always release stream to prevent native memory leak
+                try { stream?.release() } catch (_: Exception) {}
             }
         }
 

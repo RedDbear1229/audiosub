@@ -224,7 +224,7 @@ class AudioCaptureService : LifecycleService() {
     private fun initEngines() {
         val whisperDir = downloadManager.whisperModelDir()
         if (downloadManager.isBundleReady(ModelRegistry.ACTIVE_ASR)) {
-            asrEngine = SherpaAsrEngine(whisperDir)
+            asrEngine = SherpaAsrEngine(whisperDir, application)
             Log.i(TAG, "ASR engine ready (${ModelRegistry.ACTIVE_ASR.id})")
         } else {
             Log.w(TAG, "ASR model not ready — waiting for download")
@@ -268,8 +268,18 @@ class AudioCaptureService : LifecycleService() {
 
         serviceScope.launch(CoroutineDispatcherProvider.asr) {
             for (chunk in audioChunker.output) {
-                processChunk(chunk)
+                try {
+                    processChunk(chunk)
+                } catch (e: Exception) {
+                    // Catch per-chunk errors so the loop keeps running.
+                    // Native (JNI) crashes still kill the process but at least
+                    // Kotlin-level errors don't terminate the pipeline.
+                    Log.e(TAG, "청크 처리 오류 (루프 유지): ${e.javaClass.simpleName}: ${e.message}")
+                    writeCrashLog("processChunk", e)
+                    overlay.setState(PipelineState.LISTENING)
+                }
             }
+            Log.w(TAG, "청크 채널 종료 — 파이프라인 중단")
         }
     }
 
