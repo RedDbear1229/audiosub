@@ -241,8 +241,19 @@ class AudioCaptureService : LifecycleService() {
 
         val nllbDir = downloadManager.nllbModelDir()
         if (downloadManager.isBundleReady(ModelRegistry.NLLB_600M)) {
-            translationEngine = NllbTranslationEngine(nllbDir)
-            Log.i(TAG, "Translation engine ready (NLLB)")
+            try {
+                translationEngine = NllbTranslationEngine(nllbDir)
+                if (translationEngine?.isReady == true) {
+                    Log.i(TAG, "Translation engine ready (NLLB)")
+                } else {
+                    Log.w(TAG, "NLLB 엔진 초기화 실패 (isReady=false) — 원문 표시")
+                    translationEngine = null
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "NLLB 엔진 생성 실패: ${e.javaClass.simpleName}: ${e.message}")
+                writeCrashLog("NllbTranslationEngine", Exception(e))
+                translationEngine = null
+            }
         } else {
             Log.d(TAG, "NLLB 모델 없음 — 번역 생략 (원문 표시)")
         }

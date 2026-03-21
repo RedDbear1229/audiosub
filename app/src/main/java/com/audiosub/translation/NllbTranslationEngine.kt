@@ -46,8 +46,11 @@ class NllbTranslationEngine(private val modelDir: File) : TranslationEngine {
     init {
         try {
             loadModel()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to load NLLB model", e)
+        } catch (e: Throwable) {
+            // Catch Throwable (not just Exception) to handle OutOfMemoryError,
+            // UnsatisfiedLinkError (onnxruntime JNI version mismatch), etc.
+            Log.e(TAG, "Failed to load NLLB model: ${e.javaClass.simpleName}: ${e.message}")
+            isReady = false
         }
     }
 
