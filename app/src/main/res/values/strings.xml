@@ -19,4 +19,9 @@
     <string name="audio_source_mic">마이크</string>
     <string name="audio_source_system">시스템 오디오</string>
     <string name="audio_source_label">오디오 소스</string>
+    <string name="speed_mode_label">속도 모드</string>
+    <string name="speed_mode_balanced">균형 (~1.5-2초)</string>
+    <string name="speed_mode_fast">빠름 (~1-1.5초)</string>
+    <string name="speed_mode_realtime">실시간 (~0.3초)</string>
+    <string name="streaming_lang_label">인식 언어:</string>
 </resources>

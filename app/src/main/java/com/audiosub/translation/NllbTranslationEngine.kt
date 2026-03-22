@@ -7,6 +7,7 @@ import android.util.Log
 import com.audiosub.util.CoroutineDispatcherProvider
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
@@ -15,41 +16,45 @@ private const val TAG = "NllbTranslationEngine"
 // NLLB-200-distilled-600M architecture constants
 private const val NUM_DECODER_LAYERS = 12
 private const val NUM_HEADS          = 16
-private const val HEAD_DIM           = 64   // 1024 / 16
-private const val MAX_DECODE_STEPS   = 200
+private const val HEAD_DIM           = 64    // hidden_dim / num_heads = 1024 / 16
+private const val HIDDEN_DIM         = 1024
+private const val MAX_DECODE_STEPS   = 50
 
 /**
- * Translation engine backed by NLLB-200-distilled-600M (Xenova/HuggingFace ONNX).
+ * Translation engine backed by RTranslator's split NLLB-200-distilled-600M INT8 model.
  *
- * Model files expected in [modelDir]:
- *  - encoder_model.onnx            (or encoder_model_quantized.onnx)
- *  - decoder_model_merged.onnx     (or decoder_model_merged_quantized.onnx)
- *  - sentencepiece.bpe.model
+ * 4 ONNX sessions:
+ *  - NLLB_encoder.onnx           : input_ids + attention_mask + embed_matrix → last_hidden_state
+ *  - NLLB_cache_initializer.onnx : encoder_hidden_states → present.{i}.encoder.key/value (×12)
+ *  - NLLB_decoder.onnx           : token + KV cache → pre_logits + updated decoder KV
+ *  - NLLB_embed_and_lm_head.onnx : dual-mode — embedding lookup OR logits projection
  *
- * Decoder input/output naming follows HuggingFace Optimum export convention:
- *  Inputs:  input_ids, encoder_hidden_states, encoder_attention_mask,
- *           past_key_values.{i}.key, past_key_values.{i}.value
- *  Outputs: logits, present.{i}.key, present.{i}.value
- *
- * Reference: RTranslator (niedev/RTranslator) NLLB_CACHE inference logic.
+ * Token ID convention (RTranslator split model):
+ *  - Special tokens 0-3 (BOS/PAD/EOS/UNK): no offset
+ *  - BPE tokens >= 4: +1 offset applied during encode, reversed during decode
+ *  - Language tokens: 256001 + FLORES-200 index (unchanged)
  */
 class NllbTranslationEngine(private val modelDir: File) : TranslationEngine {
 
     private var env: OrtEnvironment? = null
     private var encoderSession: OrtSession? = null
+    private var cacheInitSession: OrtSession? = null
     private var decoderSession: OrtSession? = null
+    private var embedLmHeadSession: OrtSession? = null
     private var tokenizer: NllbBpeTokenizer? = null
 
     override var isReady: Boolean = false
+        private set
+
+    var initError: String = ""
         private set
 
     init {
         try {
             loadModel()
         } catch (e: Throwable) {
-            // Catch Throwable (not just Exception) to handle OutOfMemoryError,
-            // UnsatisfiedLinkError (onnxruntime JNI version mismatch), etc.
-            Log.e(TAG, "Failed to load NLLB model: ${e.javaClass.simpleName}: ${e.message}")
+            initError = "${e.javaClass.simpleName}: ${e.message?.take(120)}"
+            Log.e(TAG, "Failed to load NLLB model: $initError", e)
             isReady = false
         }
     }
@@ -59,41 +64,64 @@ class NllbTranslationEngine(private val modelDir: File) : TranslationEngine {
     // -------------------------------------------------------------------------
 
     private fun loadModel() {
-        val encoderFile = listOf("encoder_model_quantized.onnx", "encoder_model.onnx")
-            .map { File(modelDir, it) }.firstOrNull { it.exists() }
-            ?: run { Log.w(TAG, "Encoder model not found in $modelDir"); return }
+        val encoderFile    = File(modelDir, "NLLB_encoder.onnx")
+        val decoderFile    = File(modelDir, "NLLB_decoder.onnx")
+        val cacheInitFile  = File(modelDir, "NLLB_cache_initializer.onnx")
+        val embedLmFile    = File(modelDir, "NLLB_embed_and_lm_head.onnx")
+        val spFile         = File(modelDir, "sentencepiece.bpe.model")
 
-        val decoderFile = listOf("decoder_model_merged_quantized.onnx", "decoder_model_merged.onnx")
-            .map { File(modelDir, it) }.firstOrNull { it.exists() }
-            ?: run { Log.w(TAG, "Decoder model not found in $modelDir"); return }
-
-        val spFile = File(modelDir, "sentencepiece.bpe.model")
-        if (!spFile.exists()) {
-            Log.w(TAG, "sentencepiece.bpe.model not found in $modelDir")
-            return
+        val missing = listOf(encoderFile, decoderFile, cacheInitFile, embedLmFile, spFile)
+            .filter { !it.exists() }.map { it.name }
+        if (missing.isNotEmpty()) {
+            initError = "파일 없음: ${missing.joinToString()}"
+            Log.w(TAG, initError); return
         }
+
+        Log.i(TAG, "Files OK — encoder=${encoderFile.length()/1_048_576}MB " +
+                "decoder=${decoderFile.length()/1_048_576}MB " +
+                "cacheInit=${cacheInitFile.length()/1_048_576}MB " +
+                "embedLm=${embedLmFile.length()/1_048_576}MB")
 
         val onnxEnv = OrtEnvironment.getEnvironment()
         env = onnxEnv
+        Log.i(TAG, "OrtEnvironment OK")
 
         val options = OrtSession.SessionOptions().apply {
             setMemoryPatternOptimization(false)
             setCPUArenaAllocator(false)
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.NO_OPT)
+            setIntraOpNumThreads(2)  // 디코더 스텝 내 행렬 연산 병렬화
         }
 
-        Log.i(TAG, "Loading encoder: ${encoderFile.name} (${encoderFile.length() / 1_048_576} MB)")
+        Log.i(TAG, "Loading encoder…")
         encoderSession = onnxEnv.createSession(encoderFile.absolutePath, options)
+        Log.i(TAG, "Encoder OK — inputs:${encoderSession!!.inputNames} outputs:${encoderSession!!.outputNames}")
 
-        Log.i(TAG, "Loading decoder: ${decoderFile.name} (${decoderFile.length() / 1_048_576} MB)")
+        Log.i(TAG, "Loading cache initializer…")
+        cacheInitSession = onnxEnv.createSession(cacheInitFile.absolutePath, options)
+        Log.i(TAG, "CacheInit OK — inputs:${cacheInitSession!!.inputNames} outputs:${cacheInitSession!!.outputNames}")
+
+        Log.i(TAG, "Loading decoder…")
         decoderSession = onnxEnv.createSession(decoderFile.absolutePath, options)
+        Log.i(TAG, "Decoder OK — inputs:${decoderSession!!.inputNames} outputs:${decoderSession!!.outputNames}")
 
-        Log.i(TAG, "Loading SentencePiece tokenizer…")
-        tokenizer = NllbBpeTokenizer(spFile)
+        Log.i(TAG, "Loading embed+lm_head…")
+        embedLmHeadSession = onnxEnv.createSession(embedLmFile.absolutePath, options)
+        Log.i(TAG, "EmbedLmHead OK — inputs:${embedLmHeadSession!!.inputNames} outputs:${embedLmHeadSession!!.outputNames}")
+
+        Log.i(TAG, "Loading tokenizer (${spFile.length()/1024}KB)…")
+        // applyIdOffset=true: RTranslator split model uses +1 BPE token offset
+        val tk = NllbBpeTokenizer(spFile, applyIdOffset = true)
+        if (tk.vocabSize < 10_000) {
+            initError = "SPM 어휘 크기 이상: ${tk.vocabSize} (정상 ~256000). 파일 재다운로드 필요"
+            Log.e(TAG, initError); return
+        }
+        tokenizer = tk
+        Log.i(TAG, "Tokenizer OK — vocab=${tk.vocabSize}, kor_Hang=${tk.getLanguageId("kor_Hang")}")
 
         options.close()
         isReady = true
-        Log.i(TAG, "NLLB engine ready")
+        Log.i(TAG, "NLLB split engine ready")
     }
 
     // -------------------------------------------------------------------------
@@ -102,221 +130,297 @@ class NllbTranslationEngine(private val modelDir: File) : TranslationEngine {
 
     override suspend fun translate(text: String, sourceLang: String): String =
         withContext(CoroutineDispatcherProvider.translation) {
-            if (!isReady) return@withContext text
-            val tk   = tokenizer ?: return@withContext text
-            val enc  = encoderSession ?: return@withContext text
-            val dec  = decoderSession ?: return@withContext text
-            val onnx = env ?: return@withContext text
+            if (!isReady) throw IllegalStateException("NLLB engine not ready")
+            val tk      = tokenizer!!
+            val onnx    = env!!
+            val encSess = encoderSession!!
+            val ciSess  = cacheInitSession!!
+            val decSess = decoderSession!!
+            val emSess  = embedLmHeadSession!!
 
-            try {
-                val srcFlores = TokenizerWrapper.toFlores200(sourceLang)
-                val tgtFlores = TokenizerWrapper.KOREAN
+            val srcFlores = TokenizerWrapper.toFlores200(sourceLang)
+            val tgtFlores = TokenizerWrapper.KOREAN
+            val tgtLangId = tk.getLanguageId(tgtFlores)
+            val startMs   = System.currentTimeMillis()
 
-                val startMs = System.currentTimeMillis()
+            // 1. Tokenize
+            val inputIds  = tk.encode(text, srcFlores)
+            val attMask   = IntArray(inputIds.size) { 1 }
+            Log.i(TAG, "Tokenized: ${inputIds.size} tokens  src=$srcFlores tgt=$tgtFlores(id=$tgtLangId)")
 
-                // 1. Tokenize
-                val inputIds    = tk.encode(text, srcFlores)
-                val attentionMk = IntArray(inputIds.size) { 1 }
+            // 2. Embed encoder input
+            val encEmbedResult = runEmbedLmHead(onnx, emSess, inputIds, null, useLmHead = false)
+            val encEmbedMatrix = encEmbedResult.get("embed_matrix").get() as OnnxTensor
 
-                // 2. Encoder
-                val encoderHidden = runEncoder(onnx, enc, inputIds, attentionMk)
-                    ?: return@withContext text
+            // 3. Encoder
+            Log.i(TAG, "Running encoder…")
+            val t0 = System.currentTimeMillis()
+            val encoderResult = runEncoder(onnx, encSess, inputIds, attMask, encEmbedMatrix)
+            encEmbedMatrix.close(); encEmbedResult.close()
+            val hiddenState = encoderResult.get("last_hidden_state").get() as OnnxTensor
+            Log.i(TAG, "Encoder done in ${System.currentTimeMillis()-t0}ms")
 
-                // 3. Greedy decoder
-                val outputIds = greedyDecode(
-                    onnx, dec, encoderHidden,
-                    attentionMk,
-                    tgtLangId = tk.getLanguageId(tgtFlores)
-                )
+            // 4. Cache initializer — pre-compute encoder cross-attention KV (fixed for all steps)
+            Log.i(TAG, "Running cache initializer…")
+            val t1 = System.currentTimeMillis()
+            val cacheInitResult = runCacheInit(onnx, ciSess, hiddenState)
+            Log.i(TAG, "CacheInit done in ${System.currentTimeMillis()-t1}ms")
 
-                encoderHidden.close()
+            // 5. Greedy decode
+            Log.i(TAG, "Running greedy decoder…")
+            val t2 = System.currentTimeMillis()
+            val outputIds = greedyDecode(
+                onnx, decSess, emSess,
+                hiddenState, attMask, cacheInitResult, tgtLangId
+            )
+            Log.i(TAG, "Decoder done in ${System.currentTimeMillis()-t2}ms  tokens=${outputIds.toList()}")
 
-                // 4. Detokenize
-                val result = tk.decode(outputIds)
-                Log.i(TAG, "Translation done in ${System.currentTimeMillis() - startMs}ms: \"$result\"")
-                result
+            hiddenState.close()
+            cacheInitResult.close()
+            encoderResult.close()
 
-            } catch (e: Exception) {
-                Log.e(TAG, "Translation failed", e)
-                text  // fallback: return original
-            }
+            // 6. Detokenize
+            val result = tk.decode(outputIds)
+            Log.i(TAG, "Translation done in ${System.currentTimeMillis()-startMs}ms: \"$result\"")
+            if (result.isBlank()) "[번역결과없음 토큰=${outputIds.toList()}]" else result
         }
 
     override fun release() {
-        encoderSession?.close()
-        decoderSession?.close()
-        env?.close()
-        encoderSession = null
-        decoderSession = null
-        env = null
+        encoderSession?.close();    encoderSession    = null
+        cacheInitSession?.close();  cacheInitSession  = null
+        decoderSession?.close();    decoderSession    = null
+        embedLmHeadSession?.close(); embedLmHeadSession = null
+        env?.close();               env               = null
         isReady = false
         Log.i(TAG, "NLLB engine released")
     }
 
     // -------------------------------------------------------------------------
-    // Encoder inference
+    // Encoder
     // -------------------------------------------------------------------------
 
     private fun runEncoder(
         onnx: OrtEnvironment,
         session: OrtSession,
         inputIds: IntArray,
-        attentionMask: IntArray
-    ): OnnxTensor? {
+        attMask: IntArray,
+        embedMatrix: OnnxTensor
+    ): OrtSession.Result {
         val seqLen = inputIds.size.toLong()
-
         val idsTensor = OnnxTensor.createTensor(
-            onnx,
-            LongBuffer.wrap(inputIds.map { it.toLong() }.toLongArray()),
-            longArrayOf(1, seqLen)
+            onnx, LongBuffer.wrap(inputIds.map { it.toLong() }.toLongArray()), longArrayOf(1, seqLen)
         )
         val maskTensor = OnnxTensor.createTensor(
-            onnx,
-            LongBuffer.wrap(attentionMask.map { it.toLong() }.toLongArray()),
-            longArrayOf(1, seqLen)
+            onnx, LongBuffer.wrap(attMask.map { it.toLong() }.toLongArray()), longArrayOf(1, seqLen)
         )
-
         return try {
-            val inputs = mapOf("input_ids" to idsTensor, "attention_mask" to maskTensor)
-            val result = session.run(inputs)
-            idsTensor.close()
-            maskTensor.close()
-            // Return last_hidden_state tensor (caller must close it)
-            result.get("last_hidden_state").get() as OnnxTensor
+            session.run(mapOf(
+                "input_ids"      to idsTensor,
+                "attention_mask" to maskTensor,
+                "embed_matrix"   to embedMatrix
+            )).also { idsTensor.close(); maskTensor.close() }
         } catch (e: Exception) {
-            idsTensor.close()
-            maskTensor.close()
-            Log.e(TAG, "Encoder failed", e)
-            null
+            idsTensor.close(); maskTensor.close(); throw e
         }
     }
 
     // -------------------------------------------------------------------------
-    // Greedy decoder with KV cache
+    // Cache initializer
+    // -------------------------------------------------------------------------
+
+    private fun runCacheInit(
+        @Suppress("UNUSED_PARAMETER") onnx: OrtEnvironment,
+        session: OrtSession,
+        hiddenState: OnnxTensor
+    ): OrtSession.Result = session.run(mapOf("encoder_hidden_states" to hiddenState))
+
+    // -------------------------------------------------------------------------
+    // embed_and_lm_head (dual mode)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Dual-mode session:
+     *  useLmHead=false → embedding lookup: input_ids → embed_matrix
+     *  useLmHead=true  → LM head:          pre_logits → logits
+     */
+    private fun runEmbedLmHead(
+        onnx: OrtEnvironment,
+        session: OrtSession,
+        inputIds: IntArray,
+        preLogits: OnnxTensor?,
+        useLmHead: Boolean
+    ): OrtSession.Result {
+        val seqLen = inputIds.size.toLong()
+        val idsTensor = OnnxTensor.createTensor(
+            onnx, LongBuffer.wrap(inputIds.map { it.toLong() }.toLongArray()), longArrayOf(1, seqLen)
+        )
+        val logitsTensor = preLogits ?: OnnxTensor.createTensor(
+            onnx, FloatBuffer.wrap(FloatArray(HIDDEN_DIM)), longArrayOf(1, 1, HIDDEN_DIM.toLong())
+        )
+        val useLmHeadTensor = OnnxTensor.createTensor(
+            onnx, ByteBuffer.wrap(byteArrayOf(if (useLmHead) 1 else 0)),
+            longArrayOf(1), ai.onnxruntime.OnnxJavaType.BOOL
+        )
+        return try {
+            session.run(mapOf(
+                "input_ids"  to idsTensor,
+                "pre_logits" to logitsTensor,
+                "use_lm_head" to useLmHeadTensor
+            )).also {
+                idsTensor.close()
+                if (preLogits == null) logitsTensor.close()
+                useLmHeadTensor.close()
+            }
+        } catch (e: Exception) {
+            idsTensor.close()
+            if (preLogits == null) logitsTensor.close()
+            useLmHeadTensor.close()
+            throw e
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Greedy decoder
     // -------------------------------------------------------------------------
 
     private fun greedyDecode(
         onnx: OrtEnvironment,
-        session: OrtSession,
-        encoderHidden: OnnxTensor,
-        encoderAttentionMask: IntArray,
+        decSess: OrtSession,
+        emSess: OrtSession,
+        @Suppress("UNUSED_PARAMETER") hiddenState: OnnxTensor,
+        encAttMask: IntArray,
+        cacheInitResult: OrtSession.Result,
         tgtLangId: Int
     ): IntArray {
         val eos = NllbBpeTokenizer.EOS_ID
         val output = mutableListOf<Int>()
 
-        val seqLen = encoderAttentionMask.size.toLong()
+        val seqLen = encAttMask.size.toLong()
         val encMaskTensor = OnnxTensor.createTensor(
-            onnx,
-            LongBuffer.wrap(encoderAttentionMask.map { it.toLong() }.toLongArray()),
-            longArrayOf(1, seqLen)
+            onnx, LongBuffer.wrap(encAttMask.map { it.toLong() }.toLongArray()), longArrayOf(1, seqLen)
         )
 
-        // NLLB decoder starts with EOS as BOS token
-        var currentToken = NllbBpeTokenizer.EOS_ID.toLong()
+        // Extract encoder KV cache from cacheInitResult (fixed for all decode steps)
+        val encoderKV = extractKV(onnx, cacheInitResult, "encoder")
 
-        // Initialize empty KV cache [1, NUM_HEADS, 0, HEAD_DIM]
-        var kvCache = createEmptyKVCache(onnx)
+        // Empty decoder self-attention KV cache (grows each step)
+        var decoderKV = createEmptyKV(onnx, NUM_DECODER_LAYERS)
+
+        var currentToken = NllbBpeTokenizer.EOS_ID  // EOS used as BOS
 
         try {
-            for (step in 0 until MAX_DECODE_STEPS) {
-                val inputIdsTensor = OnnxTensor.createTensor(
-                    onnx,
-                    LongBuffer.wrap(longArrayOf(currentToken)),
-                    longArrayOf(1, 1)
+            for (step in 1..MAX_DECODE_STEPS) {
+                val stepMs = System.currentTimeMillis()
+
+                // a. Embed decoder input token
+                val embedResult = runEmbedLmHead(onnx, emSess, intArrayOf(currentToken), null, useLmHead = false)
+                val embedMatrix = embedResult.get("embed_matrix").get() as OnnxTensor
+
+                // b. Decoder step
+                val decResult = runDecoder(
+                    onnx, decSess, currentToken, encMaskTensor, embedMatrix,
+                    decoderKV, encoderKV
                 )
+                embedMatrix.close(); embedResult.close()
 
-                val inputs = buildDecoderInputs(
-                    inputIdsTensor, encoderHidden, encMaskTensor, kvCache
-                )
+                val preLogits = decResult.get("pre_logits").get() as OnnxTensor
 
-                val result = session.run(inputs)
-                inputIdsTensor.close()
+                // c. LM head → logits
+                val lmResult = runEmbedLmHead(onnx, emSess, intArrayOf(0), preLogits, useLmHead = true)
+                preLogits.close()
+                val logitsTensor = lmResult.get("logits").get() as OnnxTensor
 
-                // Extract logits [1, 1, vocab_size] and find argmax
-                val logits = result.get("logits").get() as OnnxTensor
-                val nextToken = if (step == 0) {
-                    // Force target language token as first output (NLLB convention)
-                    tgtLangId
-                } else {
-                    argmax(logits)
+                // d. Pick next token
+                val nextToken = if (step == 1) tgtLangId else argmax(logitsTensor)
+                logitsTensor.close(); lmResult.close()
+
+                // e. Update decoder KV cache
+                val newDecoderKV = extractKV(onnx, decResult, "decoder")
+                closeKV(decoderKV)
+                decoderKV = newDecoderKV
+                decResult.close()
+
+                if (step <= 3 || nextToken == eos) {
+                    Log.i(TAG, "Decoder step $step: token=$nextToken (${System.currentTimeMillis()-stepMs}ms)")
                 }
-                logits.close()
-
-                // Update KV cache from present.* tensors
-                val newKvCache = extractKVCache(onnx, result)
-                closeKVCache(kvCache)
-                kvCache = newKvCache
-                result.close()
 
                 output.add(nextToken)
                 if (nextToken == eos) break
-
-                currentToken = nextToken.toLong()
+                currentToken = nextToken
             }
         } finally {
             encMaskTensor.close()
-            closeKVCache(kvCache)
+            closeKV(encoderKV)
+            closeKV(decoderKV)
         }
 
         return output.toIntArray()
     }
 
-    private fun buildDecoderInputs(
-        inputIds: OnnxTensor,
-        encoderHidden: OnnxTensor,
+    private fun runDecoder(
+        onnx: OrtEnvironment,
+        session: OrtSession,
+        currentToken: Int,
         encMask: OnnxTensor,
-        kvCache: Array<OnnxTensor>
-    ): Map<String, OnnxTensor> {
+        embedMatrix: OnnxTensor,
+        decoderKV: Array<OnnxTensor>,
+        encoderKV: Array<OnnxTensor>
+    ): OrtSession.Result {
+        val idsTensor = OnnxTensor.createTensor(
+            onnx, LongBuffer.wrap(longArrayOf(currentToken.toLong())), longArrayOf(1, 1)
+        )
         val inputs = mutableMapOf<String, OnnxTensor>(
-            "input_ids"               to inputIds,
-            "encoder_hidden_states"   to encoderHidden,
-            "encoder_attention_mask"  to encMask
+            "input_ids"              to idsTensor,
+            "encoder_attention_mask" to encMask,
+            "embed_matrix"           to embedMatrix
         )
         for (i in 0 until NUM_DECODER_LAYERS) {
-            inputs["past_key_values.$i.key"]   = kvCache[i * 2]
-            inputs["past_key_values.$i.value"] = kvCache[i * 2 + 1]
+            inputs["past_key_values.$i.decoder.key"]   = decoderKV[i * 2]
+            inputs["past_key_values.$i.decoder.value"] = decoderKV[i * 2 + 1]
+            inputs["past_key_values.$i.encoder.key"]   = encoderKV[i * 2]
+            inputs["past_key_values.$i.encoder.value"] = encoderKV[i * 2 + 1]
         }
-        return inputs
+        return try {
+            session.run(inputs).also { idsTensor.close() }
+        } catch (e: Exception) {
+            idsTensor.close(); throw e
+        }
     }
 
-    /** Empty KV cache for the first decoder step: [1, NUM_HEADS, 0, HEAD_DIM]. */
-    private fun createEmptyKVCache(onnx: OrtEnvironment): Array<OnnxTensor> {
+    // -------------------------------------------------------------------------
+    // KV cache helpers
+    // -------------------------------------------------------------------------
+
+    private fun createEmptyKV(onnx: OrtEnvironment, numLayers: Int): Array<OnnxTensor> {
         val shape = longArrayOf(1, NUM_HEADS.toLong(), 0, HEAD_DIM.toLong())
-        return Array(NUM_DECODER_LAYERS * 2) {
+        return Array(numLayers * 2) {
             OnnxTensor.createTensor(onnx, FloatBuffer.wrap(FloatArray(0)), shape)
         }
     }
 
-    /** Extract present.*.key/value from decoder result into a new KV cache array. */
-    private fun extractKVCache(onnx: OrtEnvironment, result: OrtSession.Result): Array<OnnxTensor> {
-        return Array(NUM_DECODER_LAYERS * 2) { idx ->
-            val layer    = idx / 2
-            val keyOrVal = if (idx % 2 == 0) "key" else "value"
-            val name     = "present.$layer.$keyOrVal"
-            // Copy tensor data so we can close the result safely
-            val src = result.get(name).get() as OnnxTensor
-            val shape = src.info.shape
-            val buf = src.floatBuffer
-            val data = FloatArray(buf.remaining())
-            buf.get(data)
-            OnnxTensor.createTensor(onnx, FloatBuffer.wrap(data), shape)
-        }
+    /** Extract present.{i}.{type}.key/value tensors from a session result, copying data. */
+    private fun extractKV(
+        onnx: OrtEnvironment,
+        result: OrtSession.Result,
+        type: String   // "encoder" or "decoder"
+    ): Array<OnnxTensor> = Array(NUM_DECODER_LAYERS * 2) { idx ->
+        val layer    = idx / 2
+        val keyOrVal = if (idx % 2 == 0) "key" else "value"
+        val name     = "present.$layer.$type.$keyOrVal"
+        val src      = result.get(name).get() as OnnxTensor
+        val shape    = src.info.shape
+        val buf      = src.floatBuffer
+        val data     = FloatArray(buf.remaining()).also { buf.get(it) }
+        OnnxTensor.createTensor(onnx, FloatBuffer.wrap(data), shape)
     }
 
-    private fun closeKVCache(kv: Array<OnnxTensor>) {
+    private fun closeKV(kv: Array<OnnxTensor>) =
         kv.forEach { try { it.close() } catch (_: Exception) {} }
-    }
 
     private fun argmax(logits: OnnxTensor): Int {
         val buf = logits.floatBuffer
-        var maxIdx = 0
-        var maxVal = buf[0]
-        val size = buf.remaining()
-        for (i in 1 until size) {
-            val v = buf[i]
-            if (v > maxVal) { maxVal = v; maxIdx = i }
-        }
+        var maxIdx = 0; var maxVal = buf[0]
+        for (i in 1 until buf.remaining()) { val v = buf[i]; if (v > maxVal) { maxVal = v; maxIdx = i } }
         return maxIdx
     }
 }

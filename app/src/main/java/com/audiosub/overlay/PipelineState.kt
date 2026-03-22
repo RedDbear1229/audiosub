@@ -18,6 +18,6 @@ sealed class PipelineState(open val label: String, val dotColor: Int) {
         PipelineState(label, Color.parseColor("#FF9800")) // amber
     object LISTENING    : PipelineState("듣는 중...",         Color.parseColor("#4CAF50")) // green
     object TRANSCRIBING : PipelineState("전사 중...",         Color.parseColor("#2196F3")) // blue
-    object TRANSLATING  : PipelineState("번역 중...",         Color.parseColor("#9C27B0")) // purple
+    object TRANSLATING  : PipelineState("번역 중...",         Color.parseColor("#2196F3")) // blue (same as TRANSCRIBING)
     object ERROR        : PipelineState("오류",               Color.parseColor("#F44336")) // red
 }

@@ -1,10 +1,12 @@
 package com.audiosub
 
+import android.app.ActivityManager
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.util.Log
 import android.view.View
+import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -27,6 +29,8 @@ private const val TAG = "MainActivity"
 private const val PREFS_NAME = "audiosub_prefs"
 private const val PREF_DEBUG_MODE = "debug_mode"
 private const val PREF_AUDIO_SOURCE = "audio_source"
+private const val PREF_SPEED_MODE = "speed_mode"
+private const val PREF_STREAMING_LANG = "streaming_lang"
 
 class MainActivity : AppCompatActivity() {
 
@@ -45,7 +49,11 @@ class MainActivity : AppCompatActivity() {
         // Android 14+: getMediaProjection() must be called AFTER the mediaProjection-type
         // foreground service has called startForeground(). So we pass the raw resultCode
         // and data Intent to the service and let it call getMediaProjection() itself.
-        val isDebug = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_DEBUG_MODE, false)
+        val prefs2 = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val isDebug = prefs2.getBoolean(PREF_DEBUG_MODE, false)
+        val speedMode = prefs2.getString(PREF_SPEED_MODE, AudioCaptureService.SPEED_MODE_BALANCED)
+            ?: AudioCaptureService.SPEED_MODE_BALANCED
+        val streamingLang = prefs2.getString(PREF_STREAMING_LANG, "en") ?: "en"
         val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
             if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
                 putExtra(AudioCaptureService.EXTRA_RESULT_CODE, result.resultCode)
@@ -56,6 +64,8 @@ class MainActivity : AppCompatActivity() {
             }
             putExtra(AudioCaptureService.EXTRA_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_SYSTEM)
             putExtra(AudioCaptureService.EXTRA_DEBUG_MODE, isDebug)
+            putExtra(AudioCaptureService.EXTRA_SPEED_MODE, speedMode)
+            putExtra(AudioCaptureService.EXTRA_STREAMING_LANG, streamingLang)
         }
         startForegroundService(serviceIntent)
         serviceRunning = true
@@ -70,11 +80,18 @@ class MainActivity : AppCompatActivity() {
 
         downloadManager = ModelDownloadManager(this)
 
+        // Version label
+        val versionName = packageManager.getPackageInfo(packageName, 0).versionName
+        binding.tvVersion.text = "v$versionName"
+
         // Restore prefs state
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val savedDebug = prefs.getBoolean(PREF_DEBUG_MODE, false)
         val savedSource = prefs.getString(PREF_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_SYSTEM)
             ?: AudioCaptureService.AUDIO_SOURCE_SYSTEM
+        val savedSpeed = prefs.getString(PREF_SPEED_MODE, AudioCaptureService.SPEED_MODE_BALANCED)
+            ?: AudioCaptureService.SPEED_MODE_BALANCED
+        val savedStreamingLang = prefs.getString(PREF_STREAMING_LANG, "en") ?: "en"
 
         binding.switchDebugMode.isChecked = savedDebug
         if (savedSource == AudioCaptureService.AUDIO_SOURCE_MIC) {
@@ -82,6 +99,35 @@ class MainActivity : AppCompatActivity() {
         } else {
             binding.radioSystem.isChecked = true
         }
+        // Speed mode spinner
+        val speedModes = listOf(
+            getString(R.string.speed_mode_balanced)  to AudioCaptureService.SPEED_MODE_BALANCED,
+            getString(R.string.speed_mode_fast)      to AudioCaptureService.SPEED_MODE_FAST,
+            getString(R.string.speed_mode_realtime)  to AudioCaptureService.SPEED_MODE_REALTIME
+        )
+        val speedAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, speedModes.map { it.first })
+        speedAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.spinnerSpeedMode.adapter = speedAdapter
+        val savedSpeedIdx = speedModes.indexOfFirst { it.second == savedSpeed }.takeIf { it >= 0 } ?: 0
+        binding.spinnerSpeedMode.setSelection(savedSpeedIdx)
+
+        // Streaming language spinner
+        val streamingLangs = listOf("영어" to "en", "한국어" to "ko", "중국어" to "zh", "일본어" to "ja")
+        val langAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, streamingLangs.map { it.first })
+        langAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.spinnerStreamingLang.adapter = langAdapter
+        val savedLangIdx = streamingLangs.indexOfFirst { it.second == savedStreamingLang }.takeIf { it >= 0 } ?: 0
+        binding.spinnerStreamingLang.setSelection(savedLangIdx)
+        binding.spinnerStreamingLang.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                prefs.edit().putString(PREF_STREAMING_LANG, streamingLangs[pos].second).apply()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        // Show/hide streaming language selector based on speed mode
+        binding.layoutStreamingLang.visibility =
+            if (savedSpeed == AudioCaptureService.SPEED_MODE_REALTIME) View.VISIBLE else View.GONE
 
         // Save debug mode on change
         binding.switchDebugMode.setOnCheckedChangeListener { _, isChecked ->
@@ -96,6 +142,17 @@ class MainActivity : AppCompatActivity() {
                 AudioCaptureService.AUDIO_SOURCE_SYSTEM
             }
             prefs.edit().putString(PREF_AUDIO_SOURCE, source).apply()
+        }
+
+        // Save speed mode on change
+        binding.spinnerSpeedMode.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                val mode = speedModes[pos].second
+                prefs.edit().putString(PREF_SPEED_MODE, mode).apply()
+                binding.layoutStreamingLang.visibility =
+                    if (mode == AudioCaptureService.SPEED_MODE_REALTIME) View.VISIBLE else View.GONE
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
         }
 
         binding.btnToggleService.setOnClickListener {
@@ -125,6 +182,26 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateOverlayPermissionButton()
+        syncServiceState()
+    }
+
+    /** Sync UI with actual service running state (service may have stopped while we were away). */
+    private fun syncServiceState() {
+        val running = isServiceActuallyRunning()
+        if (serviceRunning != running) {
+            Log.i(TAG, "Service state sync: UI=$serviceRunning actual=$running")
+            serviceRunning = running
+            binding.btnToggleService.text = getString(
+                if (running) R.string.stop_service else R.string.start_service
+            )
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isServiceActuallyRunning(): Boolean {
+        val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        return manager.getRunningServices(Int.MAX_VALUE)
+            .any { it.service.className == AudioCaptureService::class.java.name }
     }
 
     // -------------------------------------------------------------------------
@@ -175,10 +252,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startServiceWithMic() {
-        val isDebug = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_DEBUG_MODE, false)
+        val prefs3 = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val isDebug = prefs3.getBoolean(PREF_DEBUG_MODE, false)
+        val speedMode = prefs3.getString(PREF_SPEED_MODE, AudioCaptureService.SPEED_MODE_BALANCED)
+            ?: AudioCaptureService.SPEED_MODE_BALANCED
+        val streamingLang = prefs3.getString(PREF_STREAMING_LANG, "en") ?: "en"
         val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
             putExtra(AudioCaptureService.EXTRA_AUDIO_SOURCE, AudioCaptureService.AUDIO_SOURCE_MIC)
             putExtra(AudioCaptureService.EXTRA_DEBUG_MODE, isDebug)
+            putExtra(AudioCaptureService.EXTRA_SPEED_MODE, speedMode)
+            putExtra(AudioCaptureService.EXTRA_STREAMING_LANG, streamingLang)
         }
         startForegroundService(serviceIntent)
         serviceRunning = true
@@ -289,20 +372,38 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "오버레이 권한이 없습니다. '오버레이 권한' 버튼을 먼저 눌러주세요.", Toast.LENGTH_SHORT).show()
             return
         }
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
         val testOverlay = SubtitleOverlayManager(this)
         testOverlay.attach()
-        testOverlay.showSubtitle("자막 테스트: 오버레이가 정상 작동합니다 ✓")
-        testOverlay.showDebugInfo(
-            rms = 0.042f,
-            asrText = "This is a subtitle overlay test",
-            lang = "en",
-            translationReady = false
-        )
-        // Auto-detach after 6 seconds
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        testOverlay.setState(com.audiosub.overlay.PipelineState.LISTENING)
+
+        // 1) 0s: 원문 상단 표시 (스트리밍 부분 인식 시뮬레이션)
+        testOverlay.showOriginalText("This is a subtitle")
+        // 2) 1s: 원문 확장 (부분 결과 업데이트)
+        handler.postDelayed({
+            testOverlay.showOriginalText("This is a subtitle overlay test")
+            testOverlay.setState(com.audiosub.overlay.PipelineState.TRANSLATING)
+        }, 1_000L)
+        // 3) 2.5s: 번역 완료 → 한국어 자막 표시 (원문 자동 숨김)
+        handler.postDelayed({
+            testOverlay.showSubtitle("자막 오버레이 테스트입니다")
+            testOverlay.setState(com.audiosub.overlay.PipelineState.LISTENING)
+        }, 2_500L)
+        // 4) 5s: 다음 문장 원문
+        handler.postDelayed({
+            testOverlay.showOriginalText("The overlay is working correctly")
+            testOverlay.setState(com.audiosub.overlay.PipelineState.TRANSLATING)
+        }, 5_000L)
+        // 5) 6.5s: 번역 완료
+        handler.postDelayed({
+            testOverlay.showSubtitle("오버레이가 정상 작동합니다 ✓")
+            testOverlay.setState(com.audiosub.overlay.PipelineState.LISTENING)
+        }, 6_500L)
+        // 6) 12s: 자동 종료
+        handler.postDelayed({
             testOverlay.detach()
-        }, 6_000L)
-        showStatus("자막 테스트 중 — 6초 후 자동 종료")
+        }, 12_000L)
+        showStatus("자막 테스트 중 — 12초 후 자동 종료")
     }
 
     // -------------------------------------------------------------------------

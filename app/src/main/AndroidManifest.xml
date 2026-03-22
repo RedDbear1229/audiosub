@@ -20,6 +20,9 @@
     <!-- Notifications (Android 13+) — required for WorkManager foreground notification -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Keep CPU alive during audio capture & inference -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- Network (model download) -->
     <uses-permission android:name="android.permission.INTERNET" />
 

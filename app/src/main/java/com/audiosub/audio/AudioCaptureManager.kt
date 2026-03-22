@@ -40,7 +40,8 @@ private val SYSTEM_AUDIO_CONFIGS = listOf(
  * using multiple sample-rate/channel configs. Falls back to microphone when all system
  * audio configs fail.
  *
- * @param chunker             Destination sliding-window chunker.
+ * @param chunker             Destination sliding-window chunker (null for streaming mode).
+ * @param onRawAudio          Direct audio callback for streaming mode (when chunker is null).
  * @param mediaProjection     Optional MediaProjection for system audio capture.
  * @param onLevelUpdate       Called with dBFS RMS after each read burst.
  * @param onCaptureSourceReady Called once with the actual capture source ("system"/"mic")
@@ -48,15 +49,17 @@ private val SYSTEM_AUDIO_CONFIGS = listOf(
  * @param forceMic            If true, skip system audio and use microphone directly.
  */
 class AudioCaptureManager(
-    private val chunker: AudioChunker,
+    private val chunker: AudioChunker?,
+    private val onRawAudio: ((FloatArray) -> Unit)? = null,
     private val mediaProjection: MediaProjection? = null,
     private val onLevelUpdate: ((dbfs: Float) -> Unit)? = null,
     private val onCaptureSourceReady: ((source: String, config: String) -> Unit)? = null,
-    private val forceMic: Boolean = false
+    private val onCaptureError: ((String) -> Unit)? = null,
+    private val forceMic: Boolean = false,
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) {
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
 
     // Actual capture params — set in start() once a valid config is found
     private var actualSampleRate = 44_100
@@ -122,8 +125,13 @@ class AudioCaptureManager(
         captureJob = scope.launch {
             while (isActive) {
                 val bytesRead = record.read(readBuffer, 0, readBuffer.size)
-                if (bytesRead <= 0) {
-                    Log.v(TAG, "read() returned $bytesRead — skipping")
+                if (bytesRead < 0) {
+                    Log.e(TAG, "AudioRecord.read() error: $bytesRead")
+                    onCaptureError?.invoke("AudioRecord error: $bytesRead")
+                    break
+                }
+                if (bytesRead == 0) {
+                    Log.v(TAG, "read() returned 0 — skipping")
                     continue
                 }
 
@@ -148,7 +156,11 @@ class AudioCaptureManager(
                 val resampled = PcmConverter.downsample(float32, actualSampleRate, SAMPLE_RATE_ASR)
 
                 onLevelUpdate?.invoke(computeDbfs(float32))
-                chunker.feed(resampled)
+                if (chunker != null) {
+                    chunker.feed(resampled)      // Batch mode: sliding window chunks
+                } else {
+                    onRawAudio?.invoke(resampled) // Streaming mode: direct feed
+                }
             }
         }
     }

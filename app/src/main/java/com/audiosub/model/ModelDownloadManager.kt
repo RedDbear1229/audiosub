@@ -54,10 +54,25 @@ class ModelDownloadManager(private val context: Context) {
     // Readiness + storage
     // -------------------------------------------------------------------------
 
-    fun isBundleReady(bundle: ModelRegistry.ModelBundle): Boolean =
-        bundle.requiredFiles.all { name ->
-            File(bundleDir(bundle), name).let { it.exists() && it.length() > 0L }
+    fun isBundleReady(bundle: ModelRegistry.ModelBundle): Boolean {
+        val dir = bundleDir(bundle)
+        val sizeMap: Map<String, Long> = when (val src = bundle.source) {
+            is ModelRegistry.DownloadSource.IndividualFiles ->
+                src.files.associate { it.name to it.sizeBytes }
+            else -> emptyMap()
         }
+        return bundle.requiredFiles.all { name ->
+            val file = File(dir, name)
+            if (!file.exists() || file.length() == 0L) return@all false
+            val expected = sizeMap[name] ?: return@all true   // no size info → trust existence
+            val actual = file.length()
+            if (actual != expected) {
+                Log.w(TAG, "isBundleReady: '$name' size mismatch (${actual} != ${expected}) → not ready")
+                return@all false
+            }
+            true
+        }
+    }
 
     fun areModelsReady(bundles: List<ModelRegistry.ModelBundle>): Boolean =
         bundles.all { isBundleReady(it) }
@@ -307,16 +322,23 @@ class ModelDownloadManager(private val context: Context) {
                 val dest   = File(destDir, name)
 
                 if (dest.exists() && dest.length() > 0L) {
-                    Log.i(TAG, "[$bundleId] '$name' already present, skipping")
-                    continue
+                    if (size > 0L && dest.length() != size) {
+                        Log.w(TAG, "[$bundleId] '$name' size mismatch (${dest.length()} != $size) → re-downloading")
+                        dest.delete()
+                    } else {
+                        Log.i(TAG, "[$bundleId] '$name' already present (${dest.length()} bytes), skipping")
+                        continue
+                    }
                 }
 
-                Log.i(TAG, "[$bundleId] Downloading file $name ($url)")
+                Log.i(TAG, "[$bundleId] Downloading file ${i+1}/${names.size}: $name ($url)")
                 report(
                     pct = if (totalBytes > 0) ((i.toLong() * 100) / names.size).toInt() else -1,
                     phase = PHASE_DOWNLOAD,
                     bundleId = bundleId,
-                    detail = name
+                    detail = name,
+                    fileIndex = i,
+                    fileCount = names.size
                 )
                 setForegroundIfLarge(bundleId, 0, totalBytes)
 
@@ -325,7 +347,7 @@ class ModelDownloadManager(private val context: Context) {
                         (i * 100 + filePct) / names.size
                     else
                         filePct
-                    report(overall, PHASE_DOWNLOAD, bundleId, name)
+                    report(overall, PHASE_DOWNLOAD, bundleId, name, i, names.size)
                     setForegroundIfLarge(bundleId, overall, totalBytes)
                 }
                 if (!ok) {
@@ -441,13 +463,18 @@ class ModelDownloadManager(private val context: Context) {
             return actual.equals(expectedSha256, ignoreCase = true)
         }
 
-        private suspend fun report(pct: Int, phase: String, bundleId: String, detail: String = "") {
+        private suspend fun report(
+            pct: Int, phase: String, bundleId: String,
+            detail: String = "", fileIndex: Int = -1, fileCount: Int = -1
+        ) {
             setProgress(
                 workDataOf(
-                    KEY_PROGRESS  to pct,
-                    KEY_PHASE     to phase,
-                    KEY_BUNDLE_ID to bundleId,
-                    KEY_DETAIL    to detail
+                    KEY_PROGRESS   to pct,
+                    KEY_PHASE      to phase,
+                    KEY_BUNDLE_ID  to bundleId,
+                    KEY_DETAIL     to detail,
+                    KEY_FILE_INDEX to fileIndex,
+                    KEY_FILE_COUNT to fileCount
                 )
             )
         }
@@ -506,9 +533,11 @@ class ModelDownloadManager(private val context: Context) {
             const val KEY_REQUIRED     = "required_files"
 
             // Progress output keys
-            const val KEY_PROGRESS = "progress"
-            const val KEY_PHASE    = "phase"
-            const val KEY_DETAIL   = "detail"
+            const val KEY_PROGRESS   = "progress"
+            const val KEY_PHASE      = "phase"
+            const val KEY_DETAIL     = "detail"
+            const val KEY_FILE_INDEX = "file_index"   // 0-based current file index (-1 = n/a)
+            const val KEY_FILE_COUNT = "file_count"   // total file count (-1 = n/a)
 
             // Strategy values
             const val STRATEGY_ARCHIVE = "archive"

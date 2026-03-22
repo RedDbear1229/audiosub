@@ -46,8 +46,7 @@ class SubtitleOverlayManager(private val context: Context) {
 
     private var overlayRoot: View? = null
     private var tvSubtitle: TextView? = null
-    private var tvStatus: TextView? = null
-    private var tvLevel: TextView? = null
+    private var tvOriginal: TextView? = null
     private var tvDebug: TextView? = null
     private var statusDot: View? = null
 
@@ -55,6 +54,10 @@ class SubtitleOverlayManager(private val context: Context) {
     private var subtitleHideRunnable: Runnable? = null
 
     private var debugMode: Boolean = false
+
+    // Set to true when detach() is called intentionally (service stopped).
+    // Prevents ensureAttached() from re-adding the overlay after service destruction.
+    private var isPermanentlyDetached = false
 
     // Persists across showDebugInfo calls so the header line stays accurate
     private var captureSourceLine = "소스: 대기 중"
@@ -72,19 +75,39 @@ class SubtitleOverlayManager(private val context: Context) {
         context.getSharedPreferences("audiosub_overlay_prefs", Context.MODE_PRIVATE)
     }
 
-    val isAttached: Boolean get() = overlayRoot != null
+    val isAttached: Boolean get() = overlayRoot?.isAttachedToWindow == true
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    fun attach() {
+    /**
+     * Re-attach the overlay if it was removed by the system (e.g. permission revocation,
+     * system memory pressure, fullscreen transition).
+     */
+    private fun ensureAttached() {
+        if (isPermanentlyDetached) return  // Service intentionally stopped — do not re-attach
         if (isAttached) return
+        if (overlayRoot != null) {
+            // View exists but is no longer attached to the window — clean up and re-attach
+            Log.w(TAG, "Overlay detached by system, re-attaching")
+            detach()
+        }
+        attach()
+    }
+
+    fun attach() {
+        isPermanentlyDetached = false
+        if (isAttached) return
+        // Clean up stale reference if view exists but is not attached
+        if (overlayRoot != null) {
+            try { windowManager.removeView(overlayRoot) } catch (_: Exception) {}
+            overlayRoot = null
+        }
 
         val root = LayoutInflater.from(context).inflate(R.layout.overlay_floating, null)
         tvSubtitle = root.findViewById(R.id.tvSubtitle)
-        tvStatus   = root.findViewById(R.id.tvStatus)
-        tvLevel    = root.findViewById(R.id.tvLevel)
+        tvOriginal = root.findViewById(R.id.tvOriginal)
         tvDebug    = root.findViewById(R.id.tvDebug)
         statusDot  = root.findViewById(R.id.statusDot)
 
@@ -120,6 +143,7 @@ class SubtitleOverlayManager(private val context: Context) {
     }
 
     fun detach() {
+        isPermanentlyDetached = true
         mainHandler.removeCallbacksAndMessages(null)
         val root = overlayRoot ?: return
         try {
@@ -130,8 +154,7 @@ class SubtitleOverlayManager(private val context: Context) {
         } finally {
             overlayRoot = null
             tvSubtitle = null
-            tvStatus = null
-            tvLevel = null
+            tvOriginal = null
             tvDebug = null
             statusDot = null
             layoutParams = null
@@ -158,7 +181,7 @@ class SubtitleOverlayManager(private val context: Context) {
                     lp.gravity = Gravity.TOP or Gravity.START
                     lp.x = location[0]
                     lp.y = location[1]
-                    try { windowManager.updateViewLayout(root, lp) } catch (_: Exception) {}
+                    safeUpdateLayout(root, lp)
                 }
                 dragStartParamX = lp.x
                 dragStartParamY = lp.y
@@ -177,7 +200,7 @@ class SubtitleOverlayManager(private val context: Context) {
                         val lp = layoutParams ?: return@setOnTouchListener false
                         lp.x = dragStartParamX + (event.rawX - dragStartX).toInt()
                         lp.y = dragStartParamY + (event.rawY - dragStartY).toInt()
-                        try { windowManager.updateViewLayout(v, lp) } catch (_: Exception) {}
+                        safeUpdateLayout(v, lp)
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         isDragging = false
@@ -205,7 +228,7 @@ class SubtitleOverlayManager(private val context: Context) {
 
     fun setState(state: PipelineState) {
         mainHandler.post {
-            tvStatus?.text = state.label
+            ensureAttached()
             statusDot?.backgroundTintList =
                 android.content.res.ColorStateList.valueOf(state.dotColor)
         }
@@ -215,14 +238,38 @@ class SubtitleOverlayManager(private val context: Context) {
         if (text.isBlank()) return
         Log.d(TAG, "showSubtitle: \"$text\"")
         mainHandler.post {
+            ensureAttached()
             val tv = tvSubtitle ?: return@post
             cancelSubtitleFade()
             tv.text = text
             tv.alpha = 1f
             tv.visibility = View.VISIBLE
+            // Hide original text when translation (main subtitle) arrives
+            tvOriginal?.visibility = View.GONE
             subtitleHideRunnable = Runnable { fadeOutSubtitle() }.also {
                 mainHandler.postDelayed(it, displayMs)
             }
+        }
+    }
+
+    /**
+     * Shows original language text in small font above the main subtitle.
+     * Used during streaming ASR partial results and while translation is in progress.
+     * Does NOT reset the main subtitle — previous Korean translation stays visible.
+     */
+    fun showOriginalText(text: String) {
+        if (text.isBlank()) return
+        mainHandler.post {
+            ensureAttached()
+            val tv = tvOriginal ?: return@post
+            tv.text = text
+            tv.visibility = View.VISIBLE
+        }
+    }
+
+    fun hideOriginalText() {
+        mainHandler.post {
+            tvOriginal?.visibility = View.GONE
         }
     }
 
@@ -325,16 +372,24 @@ class SubtitleOverlayManager(private val context: Context) {
     }
 
     fun updateLevel(dbfs: Float) {
-        mainHandler.post {
-            val tv = tvLevel ?: return@post
-            tv.visibility = View.VISIBLE
-            tv.text = "%.0f dBFS".format(dbfs)
-        }
+        // Level display removed — kept as no-op for API compatibility
     }
 
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /** Safely update the overlay layout, re-attaching if the window token is stale. */
+    private fun safeUpdateLayout(view: View, params: WindowManager.LayoutParams) {
+        try {
+            if (view.isAttachedToWindow) {
+                windowManager.updateViewLayout(view, params)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "updateViewLayout failed: ${e.message}, re-attaching")
+            ensureAttached()
+        }
+    }
 
     private fun fadeOutSubtitle() {
         val tv = tvSubtitle ?: return

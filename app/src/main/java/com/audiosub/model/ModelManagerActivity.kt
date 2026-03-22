@@ -55,7 +55,9 @@ class ModelManagerActivity : AppCompatActivity() {
                 Log.i(TAG, "  [${bundle.id}] ${bundle.displayName}: ${if (ready) "✓ 준비됨" else "✗ 없음"}")
             }
 
-            adapter = BundleAdapter(ModelRegistry.CATALOG, downloadManager) { action, bundle ->
+            adapter = BundleAdapter(
+                ModelRegistry.CATALOG, ModelRegistry.CATEGORY_LABELS, downloadManager
+            ) { action, bundle ->
                 Log.i(TAG, "액션: $action, 번들: ${bundle.id}")
                 handleAction(action, bundle)
             }
@@ -154,10 +156,34 @@ class ModelManagerActivity : AppCompatActivity() {
     enum class BundleAction { DOWNLOAD, CANCEL, RETRY, DELETE }
 
     class BundleAdapter(
-        private val bundles: List<ModelRegistry.ModelBundle>,
+        bundles: List<ModelRegistry.ModelBundle>,
+        categoryLabels: Map<String, String>,
         private val manager: ModelDownloadManager,
         private val onAction: (BundleAction, ModelRegistry.ModelBundle) -> Unit
-    ) : RecyclerView.Adapter<BundleAdapter.ViewHolder>() {
+    ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+        companion object {
+            private const val TYPE_HEADER = 0
+            private const val TYPE_BUNDLE = 1
+        }
+
+        // Flat list of headers (String) and bundles (ModelBundle)
+        private val items: List<Any>
+        private val bundlePositions: List<Int>  // positions that contain ModelBundle
+
+        init {
+            val flat = mutableListOf<Any>()
+            var lastCategory = ""
+            for (bundle in bundles) {
+                if (bundle.category != lastCategory) {
+                    flat.add(categoryLabels[bundle.category] ?: bundle.category)
+                    lastCategory = bundle.category
+                }
+                flat.add(bundle)
+            }
+            items = flat
+            bundlePositions = flat.indices.filter { flat[it] is ModelRegistry.ModelBundle }
+        }
 
         private val workInfoMap = mutableMapOf<String, MutableList<WorkInfo>>()
 
@@ -175,24 +201,42 @@ class ModelManagerActivity : AppCompatActivity() {
             notifyDataSetChanged()
         }
 
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
-            val view = LayoutInflater.from(parent.context)
-                .inflate(R.layout.item_model_bundle, parent, false)
-            return ViewHolder(view)
+        override fun getItemViewType(position: Int) =
+            if (items[position] is String) TYPE_HEADER else TYPE_BUNDLE
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            return if (viewType == TYPE_HEADER) {
+                val view = LayoutInflater.from(parent.context)
+                    .inflate(R.layout.item_model_header, parent, false)
+                HeaderViewHolder(view)
+            } else {
+                val view = LayoutInflater.from(parent.context)
+                    .inflate(R.layout.item_model_bundle, parent, false)
+                BundleViewHolder(view)
+            }
         }
 
-        override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-            val bundle   = bundles[position]
-            val infos    = workInfoMap[bundle.id] ?: emptyList()
-            val isReady  = manager.isBundleReady(bundle)
-            val workInfo = infos.maxByOrNull { it.state.ordinal }
-
-            holder.bind(bundle, isReady, workInfo, onAction)
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            when (holder) {
+                is HeaderViewHolder -> holder.bind(items[position] as String)
+                is BundleViewHolder -> {
+                    val bundle = items[position] as ModelRegistry.ModelBundle
+                    val infos = workInfoMap[bundle.id] ?: emptyList()
+                    val isReady = manager.isBundleReady(bundle)
+                    val workInfo = infos.maxByOrNull { it.state.ordinal }
+                    holder.bind(bundle, isReady, workInfo, onAction)
+                }
+            }
         }
 
-        override fun getItemCount() = bundles.size
+        override fun getItemCount() = items.size
 
-        class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        class HeaderViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+            private val tvHeader = view.findViewById<TextView>(R.id.tvHeader)
+            fun bind(title: String) { tvHeader.text = title }
+        }
+
+        class BundleViewHolder(view: View) : RecyclerView.ViewHolder(view) {
             private val tvName    = view.findViewById<TextView>(R.id.tvModelName)
             private val tvDesc    = view.findViewById<TextView>(R.id.tvModelDesc)
             private val tvStatus  = view.findViewById<TextView>(R.id.tvStatus)
@@ -222,9 +266,11 @@ class ModelManagerActivity : AppCompatActivity() {
                     }
                     workInfo?.state == WorkInfo.State.RUNNING ||
                     workInfo?.state == WorkInfo.State.ENQUEUED -> {
-                        val pct    = workInfo.progress.getInt(ModelDownloadManager.DownloadWorker.KEY_PROGRESS, -1)
-                        val phase  = workInfo.progress.getString(ModelDownloadManager.DownloadWorker.KEY_PHASE) ?: ""
-                        val detail = workInfo.progress.getString(ModelDownloadManager.DownloadWorker.KEY_DETAIL) ?: ""
+                        val pct       = workInfo.progress.getInt(ModelDownloadManager.DownloadWorker.KEY_PROGRESS, -1)
+                        val phase     = workInfo.progress.getString(ModelDownloadManager.DownloadWorker.KEY_PHASE) ?: ""
+                        val detail    = workInfo.progress.getString(ModelDownloadManager.DownloadWorker.KEY_DETAIL) ?: ""
+                        val fileIdx   = workInfo.progress.getInt(ModelDownloadManager.DownloadWorker.KEY_FILE_INDEX, -1)
+                        val fileCnt   = workInfo.progress.getInt(ModelDownloadManager.DownloadWorker.KEY_FILE_COUNT, -1)
 
                         val statusLabel = when (phase) {
                             ModelDownloadManager.DownloadWorker.PHASE_EXTRACT -> "압축 해제 중"
@@ -232,7 +278,7 @@ class ModelManagerActivity : AppCompatActivity() {
                             else -> if (pct >= 0) "다운로드 중 $pct%" else "다운로드 중"
                         }
                         setStatus(ctx, statusLabel, R.color.badge_downloading)
-                        showProgress(true, pct, buildProgressText(phase, pct, detail))
+                        showProgress(true, pct, buildProgressText(phase, pct, detail, fileIdx, fileCnt))
                         btnAction.text = "취소"
                         btnAction.visibility = View.VISIBLE
                         btnDelete.visibility = View.GONE
@@ -279,13 +325,17 @@ class ModelManagerActivity : AppCompatActivity() {
                 }
             }
 
-            private fun buildProgressText(phase: String, pct: Int, detail: String): String {
+            private fun buildProgressText(
+                phase: String, pct: Int, detail: String,
+                fileIdx: Int = -1, fileCnt: Int = -1
+            ): String {
                 val base = when (phase) {
                     ModelDownloadManager.DownloadWorker.PHASE_EXTRACT -> "압축 해제 중..."
                     ModelDownloadManager.DownloadWorker.PHASE_DONE    -> "완료"
                     else -> if (pct >= 0) "$pct%" else "연결 중..."
                 }
-                return if (detail.isNotBlank()) "$base  ·  $detail" else base
+                val fileInfo = if (fileIdx >= 0 && fileCnt > 0) " (${fileIdx+1}/$fileCnt)" else ""
+                return if (detail.isNotBlank()) "$base  ·  $detail$fileInfo" else base
             }
         }
     }

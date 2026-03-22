@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
@@ -21,6 +22,7 @@ import com.audiosub.MainActivity
 import com.audiosub.R
 import com.audiosub.asr.AsrEngine
 import com.audiosub.asr.SherpaAsrEngine
+import com.audiosub.asr.StreamingAsrEngine
 import com.audiosub.audio.AudioCaptureManager
 import com.audiosub.audio.AudioChunker
 import com.audiosub.model.ModelDownloadManager
@@ -31,9 +33,12 @@ import com.audiosub.translation.NllbTranslationEngine
 import com.audiosub.translation.TranslationEngine
 import com.audiosub.util.CoroutineDispatcherProvider
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "AudioCaptureService"
 private const val NOTIFICATION_CHANNEL_ID = "audiosub_service"
@@ -65,6 +70,13 @@ class AudioCaptureService : LifecycleService() {
         const val EXTRA_AUDIO_SOURCE     = "extra_audio_source"
         const val AUDIO_SOURCE_MIC       = "mic"
         const val AUDIO_SOURCE_SYSTEM    = "system"
+
+        const val EXTRA_SPEED_MODE       = "extra_speed_mode"
+        const val SPEED_MODE_BALANCED    = "balanced"   // B: 3초/1초, 4스레드
+        const val SPEED_MODE_FAST        = "fast"       // C: 2초/0.75초, 4스레드
+        const val SPEED_MODE_REALTIME    = "realtime"   // E: 스트리밍 ASR (~0.3-0.5초)
+
+        const val EXTRA_STREAMING_LANG   = "extra_streaming_lang"  // "en", "ko", "zh", "ja"
     }
 
     private val serviceJob = SupervisorJob()
@@ -78,12 +90,23 @@ class AudioCaptureService : LifecycleService() {
     private var asrEngine: AsrEngine? = null
     private var translationEngine: TranslationEngine? = null
 
+    private var streamingEngine: StreamingAsrEngine? = null
+
     private var isDebugMode: Boolean = false
     private var audioSource: String = AUDIO_SOURCE_SYSTEM
+    private var speedMode: String = SPEED_MODE_BALANCED
+    private var streamingLang: String = "en"
+    private var translationUnavailableReason: String = "모델 없음"
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // 연속 묵음 카운터 — 일정 횟수 이상이면 오디오 차단 경고 표시
     private var silentChunkCount = 0
     private val SILENCE_WARN_CHUNKS = 15  // 약 30초 (청크당 2s)
+
+    // 번역 캐시 — 슬라이딩 윈도우 특성상 동일 텍스트 반복 번역 방지 (LRU, 최대 20개)
+    private val translationCache = object : LinkedHashMap<String, String>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean = size > 20
+    }
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -95,26 +118,41 @@ class AudioCaptureService : LifecycleService() {
         createNotificationChannel()
         overlay = SubtitleOverlayManager(this)
         downloadManager = ModelDownloadManager(this)
+
+        // Prevent CPU from sleeping during audio capture & inference
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioSub::AudioCapture")
+            .apply { acquire() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
 
+        // System restart with null intent — MediaProjection data is lost, cannot recover.
+        if (intent == null) {
+            Log.w(TAG, "onStartCommand: null intent (시스템 재시작?), 서비스 종료")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // Parse extras BEFORE startForeground() so we know which service type to use
+        isDebugMode   = intent?.getBooleanExtra(EXTRA_DEBUG_MODE, false) ?: false
+        audioSource   = intent?.getStringExtra(EXTRA_AUDIO_SOURCE)   ?: AUDIO_SOURCE_SYSTEM
+        speedMode     = intent?.getStringExtra(EXTRA_SPEED_MODE)     ?: SPEED_MODE_BALANCED
+        streamingLang = intent?.getStringExtra(EXTRA_STREAMING_LANG) ?: "en"
+
         // startForeground() MUST be called before getMediaProjection() on Android 14+.
-        // Must specify FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION so Android recognises
-        // this as a mediaProjection-type service — required for getMediaProjection() to succeed.
+        // Use only the required service type to avoid unnecessary status bar indicators
+        // (e.g. mic icon when using system audio only).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification(),
+            val fgType = if (audioSource == AUDIO_SOURCE_MIC)
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            else
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
+            startForeground(NOTIFICATION_ID, buildNotification(), fgType)
         } else {
             startForeground(NOTIFICATION_ID, buildNotification())
         }
-        isDebugMode = intent?.getBooleanExtra(EXTRA_DEBUG_MODE, false) ?: false
-        audioSource = intent?.getStringExtra(EXTRA_AUDIO_SOURCE) ?: AUDIO_SOURCE_SYSTEM
 
         overlay.attach()
         overlay.setDebugMode(isDebugMode)
@@ -125,9 +163,12 @@ class AudioCaptureService : LifecycleService() {
         // Now safe to call getMediaProjection() — foreground service is running
         val projection = acquireMediaProjection(intent)
 
-        // Init engines on the ASR thread, then start capture pipeline
+        // Init engines on the ASR thread, then start capture pipeline.
+        // Wait for any active WorkManager download/extraction to finish first,
+        // so isBundleReady() returns true when initEngines() runs.
         serviceScope.launch(CoroutineDispatcherProvider.asr) {
             try {
+                waitForActiveDownloads()
                 initEngines()
                 startPipeline(projection, forceMic = (audioSource == AUDIO_SOURCE_MIC))
             } catch (e: Exception) {
@@ -137,7 +178,7 @@ class AudioCaptureService : LifecycleService() {
             }
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     /**
@@ -169,6 +210,12 @@ class AudioCaptureService : LifecycleService() {
                     override fun onStop() {
                         Log.i(TAG, "MediaProjection stopped by system")
                         MediaProjectionHolder.release()
+                        captureManager?.stop()
+                        overlay.showSubtitle(
+                            "⚠ 화면 캡처 권한이 해제되었습니다.\n앱에서 다시 시작해주세요.",
+                            displayMs = 0L
+                        )
+                        overlay.setState(PipelineState.ERROR)
                     }
                 }, Handler(Looper.getMainLooper()))
             }
@@ -188,10 +235,13 @@ class AudioCaptureService : LifecycleService() {
         captureManager?.stop()
         chunker?.reset()
         asrEngine?.release()
+        streamingEngine?.release()
         translationEngine?.release()
         overlay.detach()
         MediaProjectionHolder.release()
         serviceScope.cancel()
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     override fun onBind(intent: Intent): IBinder? = super.onBind(intent)
@@ -230,39 +280,197 @@ class AudioCaptureService : LifecycleService() {
     // Engine initialization
     // -------------------------------------------------------------------------
 
+    /**
+     * Suspend until no WorkManager download/extraction tasks are active.
+     * Shows a waiting overlay while blocked. Max wait: 300 seconds.
+     * This prevents initEngines() from seeing isBundleReady()=false when
+     * the user starts the service while a large archive (e.g. Whisper Medium 1.9 GB)
+     * is still being extracted.
+     */
+    private suspend fun waitForActiveDownloads() {
+        repeat(150) {   // 150 × 2s = 300s max
+            val infos = withContext(Dispatchers.IO) {
+                WorkManager.getInstance(applicationContext)
+                    .getWorkInfosByTag(ModelDownloadManager.TAG_DOWNLOAD)
+                    .get()
+            }
+            val isActive = infos.any {
+                it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
+            }
+            if (!isActive) return
+            overlay.setState(PipelineState.DOWNLOADING("모델 압축 해제 중... 잠시 기다려주세요"))
+            delay(2_000)
+        }
+        Log.w(TAG, "waitForActiveDownloads: 300s 타임아웃 — 강제 진행")
+    }
+
     private fun initEngines() {
-        val whisperDir = downloadManager.whisperModelDir()
-        if (downloadManager.isBundleReady(ModelRegistry.ACTIVE_ASR)) {
-            asrEngine = SherpaAsrEngine(whisperDir, application)
-            Log.i(TAG, "ASR engine ready (${ModelRegistry.ACTIVE_ASR.id})")
+        val diagLines = mutableListOf<String>()
+
+        // --- ASR ---
+        if (speedMode == SPEED_MODE_REALTIME) {
+            // Streaming ASR mode — use OnlineRecognizer with language-specific model
+            initStreamingAsr(diagLines)
         } else {
-            Log.w(TAG, "ASR model not ready — waiting for download")
+            // Batch ASR mode — use Whisper OfflineRecognizer
+            initBatchAsr(diagLines)
         }
 
-        val nllbDir = downloadManager.nllbModelDir()
-        if (downloadManager.isBundleReady(ModelRegistry.NLLB_600M)) {
+        // --- Translation (NLLB) ---
+        // Auto-detect: prefer new split model (v2), fall back to legacy merged model
+        val nllbV2Ready     = downloadManager.isBundleReady(ModelRegistry.NLLB_600M)
+        val nllbLegacyReady = downloadManager.isBundleReady(ModelRegistry.NLLB_600M_LEGACY)
+        val nllbDir = when {
+            nllbV2Ready     -> downloadManager.bundleDir(ModelRegistry.NLLB_600M)
+            nllbLegacyReady -> downloadManager.bundleDir(ModelRegistry.NLLB_600M_LEGACY)
+            else            -> downloadManager.bundleDir(ModelRegistry.NLLB_600M)
+        }
+        val nllbReady = nllbV2Ready || nllbLegacyReady
+
+        if (nllbReady) {
+            Log.i(TAG, "NLLB 모델 감지: ${if (nllbV2Ready) "split v2" else "legacy merged"} dir=$nllbDir")
             try {
                 translationEngine = NllbTranslationEngine(nllbDir)
-                if (translationEngine?.isReady == true) {
-                    Log.i(TAG, "Translation engine ready (NLLB)")
+                val nllb = translationEngine as? NllbTranslationEngine
+                if (nllb?.isReady == true) {
+                    Log.i(TAG, "Translation engine ready (NLLB ${if (nllbV2Ready) "split" else "legacy"})")
+                    diagLines.add("번역: 로딩 성공")
                 } else {
-                    Log.w(TAG, "NLLB 엔진 초기화 실패 (isReady=false) — 원문 표시")
+                    val err = nllb?.initError ?: "unknown"
+                    Log.w(TAG, "NLLB 엔진 초기화 실패: $err")
+                    translationUnavailableReason = err
                     translationEngine = null
+                    diagLines.add("번역 실패: $err")
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "NLLB 엔진 생성 실패: ${e.javaClass.simpleName}: ${e.message}")
                 writeCrashLog("NllbTranslationEngine", Exception(e))
+                translationUnavailableReason = "${e.javaClass.simpleName}: ${e.message?.take(60)}"
                 translationEngine = null
+                diagLines.add("번역 오류: ${e.javaClass.simpleName}")
             }
         } else {
-            Log.d(TAG, "NLLB 모델 없음 — 번역 생략 (원문 표시)")
+            Log.d(TAG, "NLLB 모델 없음 — v2Ready=$nllbV2Ready legacyReady=$nllbLegacyReady")
+            translationUnavailableReason = "모델 미다운로드 (모델 관리에서 다운로드)"
+            diagLines.add("번역 모델 없음")
         }
 
+        val anyAsrReady = asrEngine?.isReady == true || streamingEngine?.isReady == true
         overlay.showEngineStatus(
-            asrReady = asrEngine?.isReady == true,
+            asrReady = anyAsrReady,
             translationReady = translationEngine?.isReady == true,
             audioSource = audioSource
         )
+        // Show diagnostics on overlay (always, not just debug mode)
+        if (!anyAsrReady || translationEngine?.isReady != true) {
+            overlay.showSubtitle(diagLines.joinToString("\n"), displayMs = 10_000L)
+        }
+    }
+
+    private fun initStreamingAsr(diagLines: MutableList<String>) {
+        val bundle = when (streamingLang) {
+            "ko" -> ModelRegistry.STREAMING_KO
+            "zh" -> ModelRegistry.STREAMING_ZH
+            "ja" -> ModelRegistry.STREAMING_JA
+            else -> ModelRegistry.STREAMING_EN
+        }
+        val bundleReady = downloadManager.isBundleReady(bundle)
+        if (bundleReady) {
+            try {
+                val dir = downloadManager.bundleDir(bundle)
+                // PengChengStarling multilingual model uses zipformer2 architecture
+                val modelType = if (streamingLang == "ja") "zipformer2" else ""
+                streamingEngine = StreamingAsrEngine(
+                    modelDir = dir,
+                    app = application,
+                    numThreads = 4,
+                    modelType = modelType,
+                    onPartialResult = { text ->
+                        if (streamingLang == "ko") {
+                            overlay.showSubtitle(text)
+                        } else {
+                            // 원문을 상단 소형 텍스트로 표시 (이전 한국어 번역은 유지)
+                            overlay.showOriginalText(text)
+                        }
+                    },
+                    onFinalResult = { text ->
+                        if (streamingLang == "ko") {
+                            overlay.showSubtitle(text)
+                        } else {
+                            // 원문을 상단에 표시하고 번역 시작
+                            overlay.showOriginalText(text)
+                            launchTranslation(text, streamingLang)
+                        }
+                    }
+                )
+                if (streamingEngine?.isReady == true) {
+                    Log.i(TAG, "Streaming ASR ready (${bundle.id}, lang=$streamingLang)")
+                    diagLines.add("스트리밍 ASR: 로딩 성공 ($streamingLang)")
+                } else {
+                    Log.e(TAG, "Streaming ASR 초기화 실패")
+                    streamingEngine = null
+                    diagLines.add("스트리밍 ASR 초기화 실패")
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Streaming ASR 예외: ${e.javaClass.simpleName}: ${e.message}")
+                writeCrashLog("StreamingAsrEngine", Exception(e))
+                streamingEngine = null
+                diagLines.add("스트리밍 ASR 오류: ${e.javaClass.simpleName}")
+            }
+        } else {
+            Log.w(TAG, "Streaming model not ready: ${bundle.id}")
+            diagLines.add("스트리밍 모델 없음: ${bundle.id}\n모델 관리에서 다운로드하세요")
+        }
+    }
+
+    private fun initBatchAsr(diagLines: MutableList<String>) {
+        val whisperDir = downloadManager.whisperModelDir()
+        val asrReady = downloadManager.isBundleReady(ModelRegistry.ACTIVE_ASR)
+        if (asrReady) {
+            try {
+                val asrThreads = 4  // 균형/빠름 모두 S24급 기준 4스레드
+                asrEngine = SherpaAsrEngine(whisperDir, application, numThreads = asrThreads)
+                Log.i(TAG, "ASR engine ready (${ModelRegistry.ACTIVE_ASR.id})")
+                diagLines.add("ASR: 로딩 성공")
+            } catch (e: Throwable) {
+                Log.e(TAG, "ASR 엔진 생성 실패: ${e.javaClass.simpleName}: ${e.message}")
+                writeCrashLog("SherpaAsrEngine", Exception(e))
+                val msg = if (e is OutOfMemoryError || e.message?.contains("memory", ignoreCase = true) == true)
+                    "ASR 로딩 실패: 메모리 부족\nWhisper Medium은 여유 RAM 2 GB 이상 필요\n다른 앱을 모두 종료 후 재시작하세요"
+                else
+                    "ASR 오류: ${e.javaClass.simpleName}: ${e.message?.take(80)}"
+                diagLines.add(msg)
+            }
+        } else {
+            val missing = ModelRegistry.ACTIVE_ASR.requiredFiles.filter {
+                !java.io.File(whisperDir, it).exists()
+            }
+            Log.w(TAG, "ASR model not ready — missing: $missing dir=$whisperDir")
+            diagLines.add("ASR 모델 없음: ${missing.joinToString()}")
+        }
+    }
+
+    private fun launchTranslation(text: String, lang: String) {
+        val cacheKey = "$lang:$text"
+        val cached = translationCache[cacheKey]
+        if (cached != null) {
+            overlay.showSubtitle(cached)
+            return
+        }
+        serviceScope.launch(CoroutineDispatcherProvider.translation) {
+            try {
+                val translated = translateOrFallback(text, lang)
+                if (translated.isNotBlank() && translated != text) {
+                    translationCache[cacheKey] = translated
+                    overlay.showSubtitle(translated)
+                } else {
+                    overlay.showSubtitle(text) // 번역 결과 없으면 원문 폴백
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "번역 오류: ${e.message}")
+                overlay.showSubtitle(text) // 오류 시 원문 폴백
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -270,7 +478,44 @@ class AudioCaptureService : LifecycleService() {
     // -------------------------------------------------------------------------
 
     private fun startPipeline(projection: android.media.projection.MediaProjection?, forceMic: Boolean = false) {
-        val audioChunker = AudioChunker()
+        if (speedMode == SPEED_MODE_REALTIME && streamingEngine != null) {
+            startStreamingPipeline(projection, forceMic)
+        } else {
+            startBatchPipeline(projection, forceMic)
+        }
+    }
+
+    private fun startStreamingPipeline(projection: android.media.projection.MediaProjection?, forceMic: Boolean) {
+        Log.i(TAG, "속도 모드: realtime (스트리밍 ASR, lang=$streamingLang)")
+        captureManager = AudioCaptureManager(
+            chunker = null,
+            onRawAudio = { pcm -> streamingEngine?.feedAudio(pcm) },
+            mediaProjection = projection,
+            onLevelUpdate = { dbfs -> overlay.updateLevel(dbfs) },
+            onCaptureSourceReady = { source, config ->
+                Log.i(TAG, "캡처 소스 확정: source=$source config=$config")
+                overlay.updateCaptureSource(source, config)
+            },
+            onCaptureError = { error ->
+                Log.e(TAG, "캡처 오류: $error")
+                overlay.showSubtitle("⚠ 오디오 캡처 오류: $error", displayMs = 0L)
+                overlay.setState(PipelineState.ERROR)
+            },
+            forceMic = forceMic,
+            scope = serviceScope
+        ).also { it.start() }
+
+        overlay.setState(PipelineState.LISTENING)
+        // No chunk processing loop needed — StreamingAsrEngine handles everything via callbacks
+    }
+
+    private fun startBatchPipeline(projection: android.media.projection.MediaProjection?, forceMic: Boolean) {
+        val (chunkSec, stepSec) = when (speedMode) {
+            SPEED_MODE_FAST -> 2.0f to 0.75f
+            else            -> 3.0f to 1.0f   // BALANCED
+        }
+        Log.i(TAG, "속도 모드: $speedMode (청크 ${chunkSec}s / 스트라이드 ${stepSec}s)")
+        val audioChunker = AudioChunker(chunkSeconds = chunkSec, stepSeconds = stepSec)
         chunker = audioChunker
 
         captureManager = AudioCaptureManager(
@@ -281,7 +526,13 @@ class AudioCaptureService : LifecycleService() {
                 Log.i(TAG, "캡처 소스 확정: source=$source config=$config")
                 overlay.updateCaptureSource(source, config)
             },
-            forceMic = forceMic
+            onCaptureError = { error ->
+                Log.e(TAG, "캡처 오류: $error")
+                overlay.showSubtitle("⚠ 오디오 캡처 오류: $error", displayMs = 0L)
+                overlay.setState(PipelineState.ERROR)
+            },
+            forceMic = forceMic,
+            scope = serviceScope
         ).also { it.start() }
 
         overlay.setState(PipelineState.LISTENING)
@@ -291,9 +542,6 @@ class AudioCaptureService : LifecycleService() {
                 try {
                     processChunk(chunk)
                 } catch (e: Exception) {
-                    // Catch per-chunk errors so the loop keeps running.
-                    // Native (JNI) crashes still kill the process but at least
-                    // Kotlin-level errors don't terminate the pipeline.
                     Log.e(TAG, "청크 처리 오류 (루프 유지): ${e.javaClass.simpleName}: ${e.message}")
                     writeCrashLog("processChunk", e)
                     overlay.setState(PipelineState.LISTENING)
@@ -366,25 +614,47 @@ class AudioCaptureService : LifecycleService() {
         }
 
         val lang = result.language ?: "en"
-        val subtitle: String
         if (lang == "ko") {
-            subtitle = result.text
             Log.i(TAG, "언어=ko → 번역 생략, 원문 표시")
+            overlay.showSubtitle(result.text)
+            overlay.setState(PipelineState.LISTENING)
         } else {
             val engine = translationEngine
             if (engine != null && engine.isReady) {
-                overlay.setState(PipelineState.TRANSLATING)
-                subtitle = translateOrFallback(result.text, lang)
-                Log.i(TAG, "번역 완료: \"$subtitle\"")
+                val cacheKey = "$lang:${result.text}"
+                val cached = translationCache[cacheKey]
+                if (cached != null) {
+                    Log.i(TAG, "번역 캐시 히트: \"$cached\"")
+                    overlay.showSubtitle(cached)
+                    overlay.setState(PipelineState.LISTENING)
+                } else {
+                    // 원문을 상단에 작게 표시, 이전 번역 유지, 새 번역 완료 시 교체
+                    overlay.showOriginalText(result.text)
+                    overlay.setState(PipelineState.TRANSLATING)
+                    serviceScope.launch(CoroutineDispatcherProvider.translation) {
+                        try {
+                            val translated = translateOrFallback(result.text, lang)
+                            Log.i(TAG, "비동기 번역 완료: \"$translated\"")
+                            if (translated.isNotBlank() && translated != result.text) {
+                                translationCache[cacheKey] = translated
+                                overlay.showSubtitle(translated)
+                            } else {
+                                overlay.showSubtitle(result.text) // 번역 결과 없으면 원문 폴백
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "비동기 번역 오류: ${e.message}")
+                            overlay.showSubtitle(result.text) // 오류 시 원문 폴백
+                        } finally {
+                            overlay.setState(PipelineState.LISTENING)
+                        }
+                    }
+                }
             } else {
-                // 번역 엔진 미준비 → 원문을 언어 레이블과 함께 표시
-                subtitle = "[${lang.uppercase()}] ${result.text}"
-                Log.i(TAG, "번역 엔진 없음 → 원문 표시 (lang=$lang)")
+                overlay.showSubtitle("[번역 미준비: $translationUnavailableReason]\n${result.text}")
+                Log.w(TAG, "번역 엔진 없음 (reason=$translationUnavailableReason) → 원문 표시 (lang=$lang)")
+                overlay.setState(PipelineState.LISTENING)
             }
         }
-
-        overlay.setState(PipelineState.LISTENING)
-        if (subtitle.isNotBlank()) overlay.showSubtitle(subtitle)
     }
 
     private fun computeRms(samples: FloatArray): Float {
@@ -415,9 +685,10 @@ class AudioCaptureService : LifecycleService() {
         if (engine == null || !engine.isReady) return text
         return try {
             engine.translate(text, lang)
-        } catch (e: Exception) {
-            Log.e(TAG, "Translation error", e)
-            text
+        } catch (e: Throwable) {
+            val err = "${e.javaClass.simpleName}: ${e.message?.take(80)}"
+            Log.e(TAG, "Translation error: $err", e)
+            "[번역 오류: $err]\n$text"
         }
     }
 

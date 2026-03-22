@@ -19,7 +19,11 @@ private const val TAG = "SherpaAsrEngine"
  *
  * @param modelDir Directory containing the whisper encoder/decoder ONNX files and tokens.txt.
  */
-class SherpaAsrEngine(modelDir: File, private val app: Application? = null) : AsrEngine {
+class SherpaAsrEngine(
+    modelDir: File,
+    private val app: Application? = null,
+    numThreads: Int = 1
+) : AsrEngine {
 
     private var recognizer: OfflineRecognizer? = null
 
@@ -58,7 +62,7 @@ class SherpaAsrEngine(modelDir: File, private val app: Application? = null) : As
             val modelCfg = OfflineModelConfig.Builder()
                 .setWhisper(whisperCfg)
                 .setTokens(tokensPath)
-                .setNumThreads(1)   // 1 thread: less memory pressure, avoids native race conditions
+                .setNumThreads(numThreads)
                 .setDebug(false)
                 .setProvider("cpu")
                 .build()
@@ -89,6 +93,7 @@ class SherpaAsrEngine(modelDir: File, private val app: Application? = null) : As
                 pcmFloat.copyOf(480_000)
             } else pcmFloat
 
+            val startMs = System.currentTimeMillis()
             var stream: com.k2fsa.sherpa.onnx.OfflineStream? = null
             try {
                 // Record operation so native crash can be detected on next start
@@ -97,6 +102,8 @@ class SherpaAsrEngine(modelDir: File, private val app: Application? = null) : As
                 stream.acceptWaveform(input, 16000)
                 rec.decode(stream)
                 val result = rec.getResult(stream)
+                val elapsed = System.currentTimeMillis() - startMs
+                Log.i(TAG, "Transcribe: ${elapsed}ms, ${input.size} samples, text=\"${result.text.trim().take(40)}\"")
                 AudioSubApp.markOperation(app, null) // success — clear marker
                 AsrResult(
                     text = result.text.trim(),

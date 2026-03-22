@@ -11,8 +11,8 @@ android {
         applicationId = "com.audiosub"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -65,8 +65,9 @@ dependencies {
     implementation(libs.recyclerview)
     // sherpa-onnx: local JAR (Java API) + .so files in jniLibs/arm64-v8a/
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
-    // ONNX Runtime Java API for NLLB inference (native .so already provided by sherpa-onnx)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
+    // ONNX Runtime Java API for NLLB inference
+    // Must match sherpa-onnx's bundled libonnxruntime.so version (1.17.1)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.1")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext)

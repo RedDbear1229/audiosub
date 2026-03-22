@@ -1,5 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <TextView
+        android:id="@+id/tvVersion"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:padding="12dp"
+        android:textColor="#88888888"
+        android:textSize="11sp" />
+
+<LinearLayout
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:gravity="center"
@@ -114,8 +127,46 @@
 
             </RadioGroup>
 
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/speed_mode_label"
+                android:textSize="14sp" />
+
+            <Spinner
+                android:id="@+id/spinnerSpeedMode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp" />
+
+            <LinearLayout
+                android:id="@+id/layoutStreamingLang"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/streaming_lang_label"
+                    android:textSize="14sp" />
+
+                <Spinner
+                    android:id="@+id/spinnerStreamingLang"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp" />
+
+            </LinearLayout>
+
         </LinearLayout>
 
     </com.google.android.material.card.MaterialCardView>
 
 </LinearLayout>
+
+</FrameLayout>

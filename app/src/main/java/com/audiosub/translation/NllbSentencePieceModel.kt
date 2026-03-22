@@ -6,7 +6,7 @@ import java.io.File
  * Minimal protobuf reader for sentencepiece .model files.
  *
  * Only decodes the fields needed for BPE encoding/decoding:
- *  - ModelProto.pieces (field 4): repeated SentencePiece messages
+ *  - ModelProto.pieces (field 1): repeated SentencePiece messages
  *    - SentencePiece.piece  (field 1, string)
  *    - SentencePiece.score  (field 2, float32)
  *    - SentencePiece.type   (field 3, varint)  1=NORMAL 2=UNKNOWN 3=CONTROL
@@ -35,7 +35,7 @@ object NllbSentencePieceModel {
                 2 -> {                                     // length-delimited
                     val (len, p) = readVarint(data, pos)
                     val end = p + len.toInt()
-                    if (fieldNum == 4) pieces.add(parsePiece(data, p, end))
+                    if (fieldNum == 1) pieces.add(parsePiece(data, p, end))
                     end
                 }
                 5 -> pos + 4                               // 32-bit fixed — skip
